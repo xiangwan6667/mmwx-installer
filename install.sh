@@ -2500,7 +2500,7 @@ recover_caddy_domain() (
   phase=$(jq -er .phase "$dir/journal.json") || die '域名恢复阶段无效。'
   old=$(jq -er .old_domain "$dir/journal.json") || return 1
   new=$(jq -r .new_domain "$dir/journal.json") || return 1
-  valid_domain "$old" && [[ $DOMAIN == "$old" || $DOMAIN == "$new" ]] || die '域名恢复记录不匹配。'
+  if ! valid_domain "$old" || [[ $DOMAIN != "$old" && $DOMAIN != "$new" ]]; then die '域名恢复记录不匹配。'; fi
   case "$phase" in
     committed)
       [[ $DOMAIN == "$new" ]] || die '已提交域名与安装记录不匹配。'
