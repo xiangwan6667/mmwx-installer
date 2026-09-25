@@ -6,7 +6,10 @@ download_installer_release() {
   local directory=$1 base=https://github.com/xiangwan6667/mmwx-installer url tag expected actual
   # Resolve latest once, then pin BOTH assets to that stable release. This uses
   # the website redirect and does not consume the anonymous GitHub API quota.
-  url=$(get "$base/releases/latest" -o /dev/null -w '%{url_effective}') || { printf '无法查询正式 Release。\n' >&2; return 1; }
+  # A fresh query key avoids an old latest redirect cached after a new release.
+  url=$(get "$base/releases/latest?mmwx_check=$(date +%s%N)-$$-$RANDOM" \
+    -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+    -o /dev/null -w '%{url_effective}') || { printf '无法查询正式 Release。\n' >&2; return 1; }
   [[ $url =~ ^https://github.com/xiangwan6667/mmwx-installer/releases/tag/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]] || { printf '正式 Release 地址无效。\n' >&2; return 1; }
   tag=${BASH_REMATCH[1]}
   if ! get "$base/releases/download/$tag/install.sh" -o "$directory/install.sh" ||

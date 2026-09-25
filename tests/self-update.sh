@@ -12,10 +12,10 @@ get() {
   local url=$1 output='' tag="v$SCRIPT_VERSION"
   shift
   while (($#)); do
-    case "$1" in -o) output=$2; shift 2;; -w) shift 2;; *) return 1;; esac
+    case "$1" in -o) output=$2; shift 2;; -w|-H) shift 2;; *) return 1;; esac
   done
   case "$url" in
-    https://github.com/xiangwan6667/mmwx-installer/releases/latest)
+    https://github.com/xiangwan6667/mmwx-installer/releases/latest\?mmwx_check=*)
       [[ ${failure:-} != resolve ]] || return 1
       printf '%s' "https://github.com/xiangwan6667/mmwx-installer/releases/tag/${redirect:-$tag}";;
     "https://github.com/xiangwan6667/mmwx-installer/releases/download/$tag/install.sh")

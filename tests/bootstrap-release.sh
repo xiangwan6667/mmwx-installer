@@ -24,7 +24,7 @@ printf '%s  install.sh\n' "$hash" > "$tmp/SHA256SUMS"
 get() {
   local url=$1; shift
   case "$url" in
-    https://github.com/xiangwan6667/mmwx-installer/releases/latest) printf '%s\n' "$release" ;;
+    https://github.com/xiangwan6667/mmwx-installer/releases/latest\?mmwx_check=*) printf '%s\n' "$release" ;;
     "$asset_base/install.sh") cp "$payload" "${!#}" ;;
     "$asset_base/SHA256SUMS") cp "$tmp/SHA256SUMS" "${!#}" ;;
     *) echo "unexpected fetch URL: $url" >&2; return 1 ;;
@@ -41,7 +41,7 @@ for bad in \
   'https://github.com/xiangwan6667/mmwx-installer/releases/tag/v1.2.3-beta' \
   'https://github.com/other/repo/releases/tag/v1.2.3'; do
   # shellcheck disable=SC2317,SC2329
-  get() { local url=$1; [[ $url == https://github.com/xiangwan6667/mmwx-installer/releases/latest ]] || return 1; printf '%s\n' "$bad"; }
+  get() { local url=$1; [[ $url == https://github.com/xiangwan6667/mmwx-installer/releases/latest\?mmwx_check=* ]] || return 1; printf '%s\n' "$bad"; }
   rm -f "$marker"
   if ( bootstrap_main ) 2>"$tmp/error"; then echo "accepted invalid redirect: $bad"; exit 1; fi
   [[ ! -e $marker ]] || { echo 'executed installer after invalid redirect'; exit 1; }
@@ -50,7 +50,7 @@ done
 get() {
   local url=$1; shift
   case "$url" in
-    https://github.com/xiangwan6667/mmwx-installer/releases/latest) printf '%s\n' "$release" ;;
+    https://github.com/xiangwan6667/mmwx-installer/releases/latest\?mmwx_check=*) printf '%s\n' "$release" ;;
     "$asset_base/install.sh") cp "$payload" "${!#}" ;;
     "$asset_base/SHA256SUMS") printf 'deadbeef  install.sh\n' > "${!#}" ;;
     *) return 1 ;;
@@ -68,7 +68,7 @@ printf '%s  install.sh\n' "$hash" > "$tmp/SHA256SUMS"
 get() {
   local url=$1; shift
   case "$url" in
-    https://github.com/xiangwan6667/mmwx-installer/releases/latest) printf '%s\n' "$release" ;;
+    https://github.com/xiangwan6667/mmwx-installer/releases/latest\?mmwx_check=*) printf '%s\n' "$release" ;;
     "$asset_base/install.sh") cp "$payload" "${!#}" ;;
     "$asset_base/SHA256SUMS") cp "$tmp/SHA256SUMS" "${!#}" ;;
     *) return 1 ;;
@@ -83,7 +83,7 @@ sed -i 's/SCRIPT_VERSION=1.2.4/SCRIPT_VERSION=1.2.3/' "$payload"
 get() {
   local url=$1; shift
   case "$url" in
-    https://github.com/xiangwan6667/mmwx-installer/releases/latest) printf '%s\n' "$release" ;;
+    https://github.com/xiangwan6667/mmwx-installer/releases/latest\?mmwx_check=*) printf '%s\n' "$release" ;;
     "$asset_base/install.sh") cp "$payload" "${!#}" ;;
     "$asset_base/SHA256SUMS") return 1 ;;
     *) return 1 ;;
@@ -94,7 +94,7 @@ if ( bootstrap_main ) 2>"$tmp/error"; then echo 'accepted missing manifest'; exi
 get() {
   local url=$1; shift
   case "$url" in
-    https://github.com/xiangwan6667/mmwx-installer/releases/latest) printf '%s\n' "$release" ;;
+    https://github.com/xiangwan6667/mmwx-installer/releases/latest\?mmwx_check=*) printf '%s\n' "$release" ;;
     "$asset_base/install.sh") cp "$payload" "${!#}" ;;
     "$asset_base/SHA256SUMS") printf '%s  install.sh\n%s  install.sh\n' "$hash" "$hash" > "${!#}" ;;
     *) return 1 ;;

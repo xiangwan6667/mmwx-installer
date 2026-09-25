@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.11
+SCRIPT_VERSION=0.2.12
 SCRIPT_UPDATE_CHECKED=0 SCRIPT_UPDATE_VERSION=''
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
@@ -394,7 +394,7 @@ EOF
 }
 
 preflight() {
-  [[ $(uname -s) == Linux && $EUID == 0 ]] || die '请在 Linux 服务器上使用 root / sudo 运行。'
+  [[ $(uname -s) == Linux && $EUID == 0 ]] || die '请在 Linux 服务器上使用 root 运行。'
   # shellcheck disable=SC1091
   source /etc/os-release
   case "$ID:$VERSION_ID" in debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) ;; *) die '支持 Debian 12/13、Ubuntu 22.04/24.04/26.04。';; esac
@@ -1449,8 +1449,9 @@ check_script_update() {
   # Menu startup is best effort: no API quota, retries, cache files or script downloads.
   url=$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
     --connect-timeout 2 --max-time 3 --retry 0 --max-redirs 3 \
+    -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
     -o /dev/null -w '%{url_effective}' \
-    https://github.com/xiangwan6667/mmwx-installer/releases/latest 2>/dev/null) || return 0
+    "https://github.com/xiangwan6667/mmwx-installer/releases/latest?mmwx_check=$(date +%s%N)-$$-$RANDOM" 2>/dev/null) || return 0
   [[ $url =~ ^https://github.com/xiangwan6667/mmwx-installer/releases/tag/v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]] || return 0
   version=${BASH_REMATCH[1]}
   [[ $SCRIPT_VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 0
@@ -1463,7 +1464,10 @@ download_installer_release() {
   local directory=$1 base=https://github.com/xiangwan6667/mmwx-installer url tag expected actual
   # Resolve latest once, then pin BOTH assets to that stable release. This uses
   # the website redirect and does not consume the anonymous GitHub API quota.
-  url=$(get "$base/releases/latest" -o /dev/null -w '%{url_effective}') || { printf '无法查询正式 Release。\n' >&2; return 1; }
+  # A fresh query key avoids an old latest redirect cached after a new release.
+  url=$(get "$base/releases/latest?mmwx_check=$(date +%s%N)-$$-$RANDOM" \
+    -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+    -o /dev/null -w '%{url_effective}') || { printf '无法查询正式 Release。\n' >&2; return 1; }
   [[ $url =~ ^https://github.com/xiangwan6667/mmwx-installer/releases/tag/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]] || { printf '正式 Release 地址无效。\n' >&2; return 1; }
   tag=${BASH_REMATCH[1]}
   if ! get "$base/releases/download/$tag/install.sh" -o "$directory/install.sh" ||
@@ -2060,7 +2064,7 @@ caddy_menu() {
 
 usage() {
   cat <<'EOF'
-用法：mmwx（管理菜单）或 sudo bash install.sh [install|update|reinstall|rollback|uninstall|status|logs|resume|check|self-update|uninstall-script|caddy]
+用法（root）：mmwx（管理菜单）或 bash install.sh [install|update|reinstall|rollback|uninstall|status|logs|resume|check|self-update|uninstall-script|caddy]
   --prefix mmwx              子域名前缀（交互输入回车默认 mmwx）
   --zone example.com         Token 授权多个主域名时指定主域名
   --domain panel.example.com  兼容完整域名参数
@@ -2386,7 +2390,7 @@ main() {
       -h|--help) usage; return;; *) die "未知参数：$1";;
     esac
   done
-  [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
+  [[ $EUID == 0 ]] || die '请使用 root 运行。'
   if [[ -z $ACTION ]]; then open_installed_menu; return; fi
   case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
   case "$ACTION" in install|update|reinstall|uninstall|resume|rollback|self-update|caddy-reload|caddy-restart|caddy-token|check)

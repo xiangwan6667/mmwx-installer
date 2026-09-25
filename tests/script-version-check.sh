@@ -13,7 +13,7 @@ curl() {
   local calls; calls=$(cat "$tmp/calls"); printf '%s' "$((calls + 1))" > "$tmp/calls"
   printf '<%s>\n' "$@" >> "$tmp/argv"
   local url="${!#}"
-  [[ $url == https://github.com/xiangwan6667/mmwx-installer/releases/latest ]] || return 1
+  [[ $url == https://github.com/xiangwan6667/mmwx-installer/releases/latest\?mmwx_check=* ]] || return 1
   case $curl_mode in
     latest) printf '%s' 'https://github.com/xiangwan6667/mmwx-installer/releases/tag/v0.2.11' ;;
     equal) printf '%s' 'https://github.com/xiangwan6667/mmwx-installer/releases/tag/v0.2.10' ;;

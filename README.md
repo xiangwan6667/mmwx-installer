@@ -14,7 +14,7 @@
 
 </div>
 
-通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.11**。
+通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.12**。
 
 ## 功能
 
@@ -52,7 +52,7 @@
 以 **root** 执行以下一行命令：
 
 ```bash
-bash -o pipefail -c 'if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then apt-get update && apt-get install -y ca-certificates curl || exit; fi; curl -fsSL https://github.com/xiangwan6667/mmwx-installer/releases/latest/download/bootstrap.sh | bash'
+bash -o pipefail -c 'if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then apt-get update && apt-get install -y ca-certificates curl || exit; fi; curl -fsSL -H "Cache-Control: no-cache" "https://github.com/xiangwan6667/mmwx-installer/releases/latest/download/bootstrap.sh?mmwx_check=$(date +%s%N)-$$-$RANDOM" | bash'
 ```
 
 入口会安装管理程序并注册 `mmwx` 命令，无需保留本地下载副本。
@@ -66,13 +66,13 @@ DNS 记录由脚本创建。已有且完全匹配的代理 A 记录会直接复�
 
 ## 日常管理
 
-在任意目录运行：
+以 root 身份在任意目录运行：
 
 ```bash
-sudo mmwx
+mmwx
 ```
 
-root 用户直接运行 `mmwx`。
+本文所有命令均以 root 身份执行。
 
 | 菜单 | 操作 |
 | --- | --- |
@@ -111,7 +111,7 @@ mmwx logs          # 最近 80 行服务日志
 
 ### Caddy 管理
 
-选择菜单 **8**，或运行 `sudo mmwx caddy`：
+选择菜单 **8**，或运行 `mmwx caddy`：
 
 | 菜单 | 操作 |
 | --- | --- |
@@ -125,7 +125,7 @@ mmwx logs          # 最近 80 行服务日志
 Token 可隐藏输入，也可使用 root 所有、权限为 `600` 的文件：
 
 ```bash
-sudo mmwx caddy-token --cf-token-file /root/cloudflare.token
+mmwx caddy-token --cf-token-file /root/cloudflare.token
 ```
 
 新 Token 需具有当前域名所属 Active 区域的读取和 DNS 编辑权限。脚本先创建并删除随机临时 TXT，验证通过后更新凭据，仅重建 Caddy；网关短暂中断，妙妙屋和 PostgreSQL 保持运行，现有证书和数据保留。
@@ -161,7 +161,7 @@ sudo mmwx caddy-token --cf-token-file /root/cloudflare.token
 
 菜单 **7** 重新拉取当前版本的妙妙屋镜像，仅强制重建主控容器。Caddy 和 PostgreSQL 保持运行；数据库、应用文件、配置、证书、凭据和备份全部保留，不切换主控版本。
 
-操作前需 `y/n` 确认。镜像准备完成后才重建主控，期间网站会短暂中断；失败或中断后可用菜单 **5** 继续。也可直接运行 `sudo mmwx reinstall`。
+操作前需 `y/n` 确认。镜像准备完成后才重建主控，期间网站会短暂中断；失败或中断后可用菜单 **5** 继续。也可直接运行 `mmwx reinstall`。
 
 仍使用旧版目录时，先通过菜单 5 完成目录迁移，再执行重装。
 
@@ -200,11 +200,11 @@ Caddy 与 Cloudflare DNS 模块使用本仓库的 [预编译依赖包](https://g
 
 ## 常见问题
 
-**安装或更新失败，如何继续？** 重新运行 `mmwx`，选择菜单 5。菜单 4 可查看最近任务和失败摘要；也可运行 `sudo mmwx trace` 查看最新任务，或 `sudo mmwx trace-follow` 实时跟随。完整日志保存在 `state/logs/`，失败时会显示日志路径。
+**安装或更新失败，如何继续？** 重新运行 `mmwx`，选择菜单 5。菜单 4 可查看最近任务和失败摘要；也可运行 `mmwx trace` 查看最新任务，或 `mmwx trace-follow` 实时跟随。完整日志保存在 `state/logs/`，失败时会显示日志路径。
 
 **证书失败或出现 Cloudflare 522？** 先查看菜单 4：证书问题检查 Token 权限、域名 Active 状态与 Full (strict)；522 检查安全组、源站 IPv4 和服务状态。
 
-**能否无人值守安装？** `--yes` 只跳过全新环境提示。仍须在五分钟内从另一 IPv4 SSH 连接执行 `sudo mmwx confirm-network`；其他参数见 `mmwx --help`。
+**能否无人值守安装？** `--yes` 只跳过全新环境提示。仍须在五分钟内从另一 IPv4 SSH 连接执行 `mmwx confirm-network`；其他参数见 `mmwx --help`。
 
 ## 反馈与贡献
 
