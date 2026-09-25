@@ -16,6 +16,7 @@ jobs:
       - run: sudo bash tests/output-dependencies.sh && sudo bash tests/sync-lock.sh
       - run: sudo bash tests/entrypoint.sh && sudo bash tests/self-update.sh && sudo bash tests/bootstrap-release.sh
       - run: sudo bash tests/registry.sh && sudo bash tests/available-version.sh
+      - run: sudo bash tests/task-trace.sh && sudo bash tests/caddy-build.sh && sudo bash tests/certificate-diagnostics.sh
       - run: sudo bash tests/reinstall.sh && sudo bash tests/update-isolation.sh
       - run: sudo bash tests/caddy-management.sh && sudo bash tests/caddy-token.sh && sudo bash tests/caddy-lock.sh
   runtime:

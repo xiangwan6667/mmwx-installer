@@ -14,7 +14,7 @@
 
 </div>
 
-通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.9**。
+通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.10**。
 
 ## 功能
 
@@ -94,6 +94,18 @@ root 用户直接运行 `mmwx`。
 脚本会先检查镜像是否发布并支持本机架构。最新版镜像未就绪时，在同一通道最近 5 个版本中寻找上一可用版本，经 `y/n` 确认后使用；指定版本不可用时，可重试或重选。网络、限流和鉴权错误会停止操作。更新前完成镜像检查和下载，选择的镜像与当前运行版本相同时无需重启服务。
 
 更新管理脚本使用菜单 **9**（v0.2.4 为菜单 8，v0.2.3 及更早版本为菜单 7）；旧版没有此入口时，重新执行上方安装命令即可。管理脚本从 GitHub Releases 的最新稳定版本下载，并在安装前按同一发布版本的 `SHA256SUMS` 校验文件及脚本版本。脚本版本可用 `mmwx --version` 查看，命令参数见 `mmwx --help`。
+
+菜单 **4 · 查看日志** 提供服务日志、最近任务、历史任务、实时进度和证书申请诊断。
+
+```bash
+mmwx trace         # 最近任务和失败原因
+mmwx trace-follow  # 实时跟踪任务进度，Ctrl+C 退出
+mmwx logs          # 最近 80 行服务日志
+```
+
+任务日志保存在 `state/logs/task-*.log`，记录时间、脚本版本、步骤、退出码、失败位置及摘要；完整步骤输出保存在同目录的 `step-*.log`。日志写入前会脱敏已配置的 Token 和密码。完全卸载会删除这些日志。
+
+证书申请失败会识别 ACME 限流，显示原始原因及 CA 提供的重试时间。不要反复删除证书目录；修复问题或等限流解除后，选择菜单 5 继续。脚本没有设置默认申请邮箱，已有 ACME 账户随证书目录持久保存。[Let’s Encrypt 限制说明](https://letsencrypt.org/docs/rate-limits/)
 
 ### Caddy 管理
 
@@ -186,7 +198,7 @@ Caddy 与 Cloudflare DNS 模块使用本仓库的 [预编译依赖包](https://g
 
 ## 常见问题
 
-**安装或更新失败，如何继续？** 重新运行 `mmwx`，选择菜单 5。耗时步骤的完整日志保存在 `state/logs/`，失败时会显示日志路径。
+**安装或更新失败，如何继续？** 重新运行 `mmwx`，选择菜单 5。菜单 4 可查看最近任务和失败摘要；也可运行 `sudo mmwx trace` 查看最新任务，或 `sudo mmwx trace-follow` 实时跟随。完整日志保存在 `state/logs/`，失败时会显示日志路径。
 
 **证书失败或出现 Cloudflare 522？** 先查看菜单 4：证书问题检查 Token 权限、域名 Active 状态与 Full (strict)；522 检查安全组、源站 IPv4 和服务状态。
 

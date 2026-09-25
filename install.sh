@@ -4,26 +4,123 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.9
+SCRIPT_VERSION=0.2.10
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
+TRACE_LOG='' TRACE_ACTION=''
 
 paint() { if [[ -t 1 && -z ${NO_COLOR:-} ]]; then printf '\033[%sm%s\033[0m\n' "$1" "$2"; else printf '%s\n' "$2"; fi; }
 info() { paint 36 "  $*"; }
-die() { paint 31 "  错误：$*" >&2; exit 1; }
+die() { trace_event ERROR "exit=1 source=${BASH_SOURCE[1]##*/}:${BASH_LINENO[0]} function=${FUNCNAME[1]:-main} $*"; paint 31 "  错误：$*" | trace_redact >&2; exit 1; }
 section() { printf '\n'; paint '1;36' "  $*"; printf '  ────────────────────────────────────────\n'; }
-run_step() (
-  local label=$1 logfile pid code=0 elapsed=0
+trace_redact() (
+  set +x
+  local path item line value
+  local -a secrets=()
+  for path in "$ROOT/config/cloudflare.token" "$ROOT/cloudflare.token" "${TOKEN_FILE:-}" "${TEMP_TOKEN:-}" \
+    "$ROOT/config/caddy.env" "$ROOT/config/postgres.env" "$ROOT/config/app.env" \
+    "$ROOT/state/caddy-token-change/old.token" "$ROOT/state/caddy-token-change/candidate.token"; do
+    [[ -n $path && -f $path ]] || continue
+    [[ -r $path ]] || { printf '凭据不可读，已隐藏日志输出。\n'; cat >/dev/null; return 1; }
+    while IFS= read -r item || [[ -n $item ]]; do
+      if [[ $path == *.env ]]; then
+        case "${item%%=*}" in *TOKEN*|*PASSWORD*|*SECRET*) value=${item#*=};; *) continue;; esac
+      else value=$item; fi
+      value=${value%$'\r'}; value=${value#\"}; value=${value%\"}; value=${value#\'}; value=${value%\'}
+      [[ -z $value ]] || secrets+=("$value")
+    done < "$path"
+  done
+  while IFS= read -r line || [[ -n $line ]]; do
+    for value in "${secrets[@]}"; do line=${line//"$value"/[REDACTED]}; done
+    printf '%s\n' "$line"
+  done
+)
+trace_event() {
+  local level=$1
   shift
-  mkdir -p "$ROOT/state/logs"
-  logfile=$(mktemp "$ROOT/state/logs/step-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")
+  [[ -n ${TRACE_LOG:-} && -f $TRACE_LOG ]] || return 0
+  printf '%s %-12s %s\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$level" "$*" | trace_redact >> "$TRACE_LOG" || return 0
+}
+trace_start() {
+  local directory=$ROOT/state/logs
+  [[ ! -L $ROOT && ! -L $ROOT/state && ! -L $directory ]] || die '日志目录不能是符号链接。'
+  mkdir -p "$directory" || return 1
+  chmod 700 "$directory" || return 1
+  TRACE_ACTION=$1
+  TRACE_LOG=$(mktemp "$directory/task-$(date +%Y%m%d-%H%M%S)-XXXXXX.log") || return 1
+  chmod 600 "$TRACE_LOG" || return 1
+  trace_event START "action=$TRACE_ACTION version=$SCRIPT_VERSION arch=$(uname -m) pid=$$"
+}
+trace_finish() {
+  trace_event FINISH "action=${TRACE_ACTION:-unknown} exit=$1"
+  if [[ $1 != 0 && -n ${TRACE_LOG:-} && -f $TRACE_LOG ]]; then printf '  任务日志：%s（mmwx trace）\n' "$TRACE_LOG" >&2; fi
+}
+trace_error() {
+  trace_event ERROR "exit=$1 source=install.sh:$2 function=$3"
+  printf '操作未完成，可运行 mmwx 继续（第 %s 行，退出码 %s）。\n' "$2" "$1" >&2
+}
+trace_latest() {
+  [[ -d $ROOT/state/logs ]] || return 0
+  find "$ROOT/state/logs" -maxdepth 1 -type f -name 'task-*.log' -printf '%T@ %f\n' | LC_ALL=C sort -nr | sed -n '1s/^[^ ]* //p'
+}
+trace_show() {
+  local file
+  file=$(trace_latest)
+  [[ -n $file ]] || { info '暂无任务日志。'; return 0; }
+  info "任务日志：$ROOT/state/logs/$file"
+  tail -n 120 "$ROOT/state/logs/$file" | trace_redact
+}
+trace_follow() {
+  local file
+  file=$(trace_latest)
+  [[ -n $file ]] || { info '暂无任务日志。'; return 0; }
+  info '实时追踪任务；Ctrl+C 退出。'
+  tail -n 80 -F "$ROOT/state/logs/$file"
+}
+logs_menu() {
+  local choice index file
+  local -a files=()
+  while true; do
+    section '日志与诊断'
+    printf '  1  服务日志\n  2  最近任务\n  3  历史任务\n  4  实时追踪最近任务\n  5  证书申请诊断\n  0  返回\n'
+    choice=$(ask '选择：')
+    case "$choice" in
+      1) load_state; caddy_redacted_command dc logs --tail 80 caddy mmwx;;
+      2) trace_show;;
+      3)
+        files=()
+        if [[ -d $ROOT/state/logs ]]; then mapfile -t files < <(find "$ROOT/state/logs" -maxdepth 1 -type f -name 'task-*.log' -printf '%T@ %f\n' | LC_ALL=C sort -nr | sed -n '1,20s/^[^ ]* //p'); fi
+        if ((${#files[@]} == 0)); then info '暂无任务日志。'; continue; fi
+        for index in "${!files[@]}"; do printf '  %s  %s\n' "$((index+1))" "${files[$index]}"; done
+        choice=$(ask '任务编号（回车返回）：')
+        [[ $choice =~ ^[1-9][0-9]?$ && $choice -le ${#files[@]} ]] || continue
+        file=$ROOT/state/logs/${files[$((choice-1))]}
+        tail -n 200 "$file" | trace_redact;;
+      4) (trap 'exit 0' INT TERM; trace_follow) || true;;
+      5) caddy_tls_diagnose '' || true;;
+      0|'') return 0;; *) info '无效选择。';;
+    esac
+  done
+}
+trace_step_command() (
+  set +x
+  set -o pipefail
+  "$@" 2>&1 | trace_redact
+)
+run_step() (
+  local label=$1 logfile pid code=0 elapsed=0 source=${BASH_SOURCE[1]##*/}:${BASH_LINENO[0]} command_name=${2##*/}
+  shift
+  mkdir -p "$ROOT/state/logs" || return 1
+  logfile=$(mktemp "$ROOT/state/logs/step-$(date +%Y%m%d-%H%M%S)-XXXXXX.log") || return 1
+  printf 'step=%s command=%s source=%s version=%s\n' "$label" "$command_name" "$source" "$SCRIPT_VERSION" | trace_redact > "$logfile"
+  trace_event STEP_START "step=$label command=$command_name source=$source log=$logfile"
   printf '  · %s\n' "$label"
   # Separate process group covers wrappers (dc) and their external children.
   set -m
-  "$@" > "$logfile" 2>&1 &
+  trace_step_command "$@" >> "$logfile" 2>&1 &
   pid=$!
-  trap 'kill -TERM -- "-$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; printf "\n  已中断；日志：%s\n" "$logfile"; exit 130' INT TERM
+  trap 'kill -TERM -- "-$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; trace_event INTERRUPTED "step=$label exit=130 log=$logfile"; printf "\n  已中断；日志：%s\n" "$logfile"; exit 130' INT TERM
   if [[ -t 1 ]]; then
     while kill -0 "$pid" 2>/dev/null; do
       printf '\r  · %s … %ss' "$label" "$elapsed"
@@ -33,7 +130,10 @@ run_step() (
     printf '\r\033[K'
   fi
   wait "$pid" 2>/dev/null || code=$?
-  if [[ $code == 0 ]]; then printf '  ✓ %s\n' "$label"; else
+  printf 'exit=%s\n' "$code" >> "$logfile"
+  if [[ $code == 0 ]]; then trace_event STEP_OK "step=$label exit=0"; printf '  ✓ %s\n' "$label"; else
+    trace_event STEP_FAILED "step=$label exit=$code source=$source log=$logfile"
+    if [[ -n ${TRACE_LOG:-} && -f $TRACE_LOG ]]; then tail -n 20 "$logfile" | trace_redact >> "$TRACE_LOG"; fi
     printf '  ✗ %s\n' "$label" >&2
     tail -n 12 "$logfile" >&2
     printf '  完整日志：%s\n' "$logfile" >&2
@@ -357,16 +457,28 @@ install_docker() {
   fi
   iptables -nL DOCKER-USER >/dev/null || die '需要 Docker iptables 后端的 DOCKER-USER 链。'
 }
+verify_caddy_module() {
+  local image=$1 modules
+  # Keep the producer alive until it has finished writing.  Piping directly
+  # to grep can make docker receive SIGPIPE when the match appears early.
+  if ! modules=$(docker run --rm --network none "$image" caddy list-modules); then
+    printf '%s\n' "$modules"
+    return 2
+  fi
+  printf '%s\n' "$modules"
+  grep -Fxq 'dns.providers.cloudflare' <<<"$modules" || return 1
+}
 build_caddy() {
   local builddir architecture asset
   case $(uname -m) in x86_64) architecture=amd64;; aarch64) architecture=arm64;; *) die '不支持的架构。';; esac
   asset="caddy-linux-$architecture.gz"
   builddir=$(mktemp -d)
   info '下载预编译的 Caddy + Cloudflare 模块（服务器无需编译）……'
-  get "https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.1.0-rc.1/$asset" -o "$builddir/$asset"
-  get 'https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.1.0-rc.1/SHA256SUMS' -o "$builddir/SHA256SUMS"
+  run_step '下载 Caddy DNS 模块' get "https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.1.0-rc.1/$asset" -o "$builddir/$asset" || { rm -rf "$builddir"; die 'Caddy 下载失败，详情见任务日志。'; }
+  run_step '下载 Caddy 校验文件' get 'https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.1.0-rc.1/SHA256SUMS' -o "$builddir/SHA256SUMS" || { rm -rf "$builddir"; die 'Caddy 校验文件下载失败。'; }
   (cd "$builddir"; grep -E "^[a-f0-9]{64}  $asset$" SHA256SUMS | sha256sum --status -c -) || { rm -rf "$builddir"; die 'Caddy 下载校验失败。'; }
-  gzip -dc "$builddir/$asset" > "$builddir/caddy"
+  run_step '解压 Caddy DNS 模块' gzip -dk "$builddir/$asset" || { rm -rf "$builddir"; die 'Caddy 解压失败，详情见任务日志。'; }
+  mv "$builddir/${asset%.gz}" "$builddir/caddy"
   chmod 0755 "$builddir/caddy"
   cat > "$builddir/Dockerfile" <<'EOF'
 FROM caddy:2.11.4
@@ -376,7 +488,14 @@ EOF
   run_step '组装 Caddy 镜像' docker build --pull -t mmwx-installer-caddy:2.11.4-cf0.2.4 "$builddir" || { rm -rf "$builddir"; die 'Caddy 构建失败，请检查网络、内存和磁盘。'; }
   rm -rf "$builddir"
   CADDY_IMAGE=mmwx-installer-caddy:2.11.4-cf0.2.4
-  docker run --rm --network none "$CADDY_IMAGE" caddy list-modules | grep -qx dns.providers.cloudflare || die 'Caddy 缺少 Cloudflare 模块。'
+  local module_status=0
+  run_step '验证 Caddy Cloudflare 模块' verify_caddy_module "$CADDY_IMAGE" || module_status=$?
+  case $module_status in
+    1) die 'Caddy 缺少 Cloudflare 模块。';;
+    2) die '无法执行 Caddy 模块检查，请检查 Docker。';;
+    0) :;;
+    *) die 'Caddy 模块检查失败，请检查 Docker。';;
+  esac
 }
 channel_name() { if [[ $1 == beta ]]; then printf '测试版'; else printf '正式版'; fi; }
 select_version_menu() {
@@ -999,17 +1118,94 @@ save_state() {
   mv "$ROOT/state/state.json.tmp" "$ROOT/state/state.json"
 }
 verify_https() {
-  local attempt
+  local attempt origin_ready=0 diagnosis=0
   mkdir -p "$ROOT/state/logs"
   info '等待 Caddy 完成 DNS-01 签发并验证 HTTPS（最多五分钟）……'
   for ((attempt=0; attempt<60; attempt++)); do
-    if curl -fsS --noproxy '*' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" -o /dev/null 2>/dev/null; then
+    origin_ready=0
+    if curl -fsS --noproxy '*' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" -o /dev/null 2> "$ROOT/state/logs/origin-check.log"; then
+      origin_ready=1
       if curl -fsSL --max-redirs 3 --max-time 15 "https://$DOMAIN/" -o /dev/null 2>> "$ROOT/state/logs/https-check.log"; then return 0; fi
     fi
     sleep 5
   done
-  die '容器已启动，但 HTTPS 验证未通过。检查 Caddy 日志、Token、Cloudflare Full (strict) 和安全组，不能视为安装成功。'
+  if [[ $origin_ready == 1 ]]; then
+    trace_event HTTPS_FAILED '源站 TLS 已通过，公网 HTTPS 未通过。请检查 Cloudflare Full (strict)、DNS 和安全组。'
+    if [[ -n ${TRACE_LOG:-} && -f $TRACE_LOG ]]; then tail -n 12 "$ROOT/state/logs/https-check.log" | trace_redact >> "$TRACE_LOG"; fi
+    die '源站证书有效，但公网 HTTPS 验证失败。请检查 Cloudflare Full (strict)、DNS 和安全组；详见 mmwx trace。'
+  fi
+  if [[ -n ${TRACE_LOG:-} && -f $TRACE_LOG ]]; then tail -n 12 "$ROOT/state/logs/origin-check.log" | trace_redact >> "$TRACE_LOG"; fi
+  run_step '诊断证书申请' caddy_tls_diagnose '' || diagnosis=$?
+  [[ $diagnosis != 2 ]] || die '证书申请触发 CA 速率限制，请按日志中的重试时间等待；保留现有证书，用菜单 5 继续。'
+  die '源站 HTTPS 尚未就绪。请从菜单 4 查看任务日志及证书申请诊断，再用菜单 5 继续。'
 }
+# Diagnose explicit CA/DNS errors; generic HTTP 429 is not an ACME limit.
+caddy_tls_diagnose_text() {
+  python3 -c '
+import json, re, sys
+lines = sys.stdin.read().splitlines()
+def readable(line):
+    try:
+        obj = json.loads(line[line.index("{"):])
+        def strings(value):
+            if isinstance(value, dict):
+                return [part for key, item in value.items() for part in ([key] + strings(item))]
+            if isinstance(value, list):
+                return [part for item in value for part in strings(item)]
+            return [str(value)]
+        return " | ".join(strings(obj))
+    except (ValueError, TypeError):
+        return line
+rows = [readable(line) for line in lines]
+for row in reversed(rows):
+    if re.search(r"urn:ietf:params:acme:error:rateLimited|too many certificates|too many failed authorizations", row, re.I):
+        print("检测到 ACME 证书签发速率限制。")
+        if re.search(r"too many failed authorizations|authorization failures", row, re.I):
+            print("类型：域名验证失败次数过多。先检查 DNS 和权限，再按 CA 指定时间重试。")
+        elif re.search(r"exact (?:same )?set|duplicate", row, re.I):
+            print("类型：相同域名集合重复签发过多。")
+        else:
+            print("类型：CA 签发配额限制，具体范围以原始原因说明为准。")
+        print("原始原因：" + row[:3000])
+        retry = re.search(r"retry[-_ ]after(?:[\s:=|]+)([^|;]+)", row, re.I)
+        if retry:
+            print("CA 返回的重试信息：" + retry[0][:300])
+        else:
+            print("日志未包含明确重试时间，请按 CA 错误详情等待后再试。")
+        print("保留现有证书目录，不要反复删除证书或重建以强制申请。")
+        print("限制说明：https://letsencrypt.org/docs/rate-limits/")
+        sys.exit(2)
+for row in reversed(rows):
+    error = re.search(r"error|failed|unauthorized|invalid", row, re.I)
+    dns = re.search(r"dns[-_ ]?01|dns challenge|cloudflare|authoritative nameservers", row, re.I)
+    if error and dns:
+        print("检测到 DNS-01 验证失败，请检查 Token 权限、区域和 DNS 传播。")
+        print("原始原因：" + row[:3000])
+        sys.exit(1)
+print("未在最近的 Caddy 日志中检测到明确的 ACME 证书速率限制。")
+'
+}
+caddy_tls_diagnose() (
+  local text=${1-} temporary result=0 logfile
+  temporary=$(mktemp) || return 1
+  trap 'rm -f -- "$temporary"' EXIT
+  if [[ -z $text ]]; then
+    if ! caddy_redacted_command dc logs --no-color --since 15m --tail 100 caddy > "$temporary"; then
+      info '无法读取 Caddy 日志，请检查 Docker 和 Caddy 状态。'
+      return 1
+    fi
+    text=$(cat "$temporary")
+  fi
+  printf '%s\n' "$text" | trace_redact > "$temporary"
+  if [[ -d $ROOT ]]; then
+    mkdir -p "$ROOT/state/logs" || return 1
+    logfile=$(mktemp "$ROOT/state/logs/tls-$(date +%Y%m%d-%H%M%S)-XXXXXX.log") || return 1
+    cp "$temporary" "$logfile" || return 1
+    trace_event TLS_DIAGNOSIS "log=$logfile"
+  fi
+  caddy_tls_diagnose_text < "$temporary" || result=$?
+  return "$result"
+)
 load_state() {
   [[ -f $ROOT/state/state.json ]] || die '未发现本安装器的安装记录。'
   DOMAIN=$(jq -er .domain "$ROOT/state/state.json")
@@ -1855,6 +2051,7 @@ usage() {
 安装需确认新 SSH 连接；check 只检查环境，不修改系统。
 reinstall 重新拉取当前版本镜像，仅重建妙妙屋容器，保留全部数据和配置。
 self-update 从最新正式 Release 更新管理脚本，并校验 SHA-256。
+trace 查看最近任务及失败原因；trace-follow 实时追踪；log-menu 打开日志与诊断。
 caddy 打开网关管理菜单；caddy-token --cf-token-file /root/token 替换 Token。
 caddy-status / caddy-logs / caddy-reload / caddy-restart / caddy-certificates 可直接执行。
 EOF
@@ -2138,7 +2335,7 @@ menu() {
     printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n    7  强制重新安装\n\n  管理\n    8  Caddy 管理\n    9  更新管理脚本\n   10  卸载服务\n   11  卸载管理脚本\n\n    0  退出\n\n'
     choice=$(ask '选择：')
     case "$choice" in
-      1) action=install;; 2) action=update;; 3) action=status;; 4) action=logs;;
+      1) action=install;; 2) action=update;; 3) action=status;; 4) action=log-menu;;
       5) action=resume;; 6) action=rollback;;
       7) action=reinstall;; 8) action=caddy;; 9) action=self-update;; 10) action=uninstall;; 11) action=uninstall-script;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
@@ -2158,7 +2355,7 @@ main() {
   fi
   while (($#)); do
     case "$1" in
-      install|update|reinstall|uninstall|status|logs|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network|caddy|caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates|caddy-token) ACTION=$1; shift;;
+      install|update|reinstall|uninstall|status|logs|log-menu|trace|trace-follow|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network|caddy|caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates|caddy-token) ACTION=$1; shift;;
       --yes) ACCEPT=1; shift;;
       --domain|--prefix|--zone|--channel|--cf-token-file)
         [[ $# -ge 2 ]] || die "缺少参数：$1"
@@ -2170,6 +2367,9 @@ main() {
   [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
   if [[ -z $ACTION ]]; then open_installed_menu; return; fi
   case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  case "$ACTION" in install|update|reinstall|uninstall|resume|rollback|self-update|caddy-reload|caddy-restart|caddy-token|check)
+    trace_start "$ACTION" || die '无法创建任务日志。';;
+  esac
   if [[ -f $ROOT/state/docker-purge.json ]]; then
     case "$ACTION" in install|update|reinstall|resume|rollback|caddy-reload|caddy-restart|caddy-token)
       die '完全卸载尚未完成，请从菜单 10 继续。';;
@@ -2191,6 +2391,7 @@ main() {
     self-update) self_update;; rollback) rollback_stack;;
     uninstall-script) uninstall_script;;
     status) load_state; dc ps; ufw status;; logs) load_state; caddy_redacted_command dc logs --tail 80 caddy mmwx;;
+    log-menu) logs_menu;; trace) trace_show;; trace-follow) trace_follow;;
     resume) resume_task;;
     caddy) caddy_menu;;
     caddy-token) replace_caddy_token;;
@@ -2198,8 +2399,8 @@ main() {
   esac
 }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-  trap '[[ -z $TEMP_TOKEN ]] || rm -f "$TEMP_TOKEN"' EXIT
-  trap 'printf "操作未完成，可运行 mmwx 继续（第 %s 行）。\n" "$LINENO" >&2' ERR
-  trap 'printf "\n已中断，运行 mmwx 继续。\n"; exit 130' INT TERM
+  trap 'trace_finish "$?"; [[ -z $TEMP_TOKEN ]] || rm -f "$TEMP_TOKEN"' EXIT
+  trap 'trace_error "$?" "$LINENO" "${FUNCNAME[*]:-main}"' ERR
+  trap 'trace_event INTERRUPTED "exit=130"; printf "\n已中断，运行 mmwx 继续。\n"; exit 130' INT TERM
   main "$@"
 fi

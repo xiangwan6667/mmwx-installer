@@ -1,5 +1,14 @@
 # 发布记录
 
+## v0.2.10
+
+- 修复 Caddy 模块检查因管道提前关闭产生 `broken pipe`，误报缺少 Cloudflare 模块的问题。
+
+- 菜单 4 新增日志与诊断子菜单，可查看服务日志、最近任务和失败摘要，并跟随最新任务进度。
+- 新增 `mmwx trace`、`mmwx trace-follow` 和 `mmwx log-menu` 命令，便于在终端查看及跟踪任务。
+- 任务日志记录操作上下文、步骤、命令名、来源行、退出码和失败摘要；Cloudflare Token、密码及 Token 文件内容写入前自动脱敏。
+- 证书诊断识别 ACME 速率限制和提供商重试提示，并保留现有 ACME 账户，不设置默认邮箱。
+
 ## v0.2.9
 
 - 完全卸载清理 Docker 镜像、网络、Docker 与 containerd 数据目录及相关软件包，并保留 `mmwx` 管理命令。
