@@ -29,7 +29,7 @@ iptables() { return 1; }
 ipset() { return 1; }
 remove_legacy_cf_rules() { :; }
 # Keep unit-file removal inside this test's filesystem boundary.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 rm() { :; }
 real_remove_services
 unset -f rm
