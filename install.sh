@@ -4,7 +4,8 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.10
+SCRIPT_VERSION=0.2.11
+SCRIPT_UPDATE_CHECKED=0 SCRIPT_UPDATE_VERSION=''
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -1440,6 +1441,24 @@ finish_reinstall() {
   rm -f "$ROOT/state/reinstall.json"
   info "妙妙屋重装完成：$VERSION。数据、配置、证书和凭据均保留。"
 }
+check_script_update() {
+  [[ $SCRIPT_UPDATE_CHECKED == 0 ]] || return 0
+  SCRIPT_UPDATE_CHECKED=1
+  SCRIPT_UPDATE_VERSION=''
+  local url version newest
+  # Menu startup is best effort: no API quota, retries, cache files or script downloads.
+  url=$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+    --connect-timeout 2 --max-time 3 --retry 0 --max-redirs 3 \
+    -o /dev/null -w '%{url_effective}' \
+    https://github.com/xiangwan6667/mmwx-installer/releases/latest 2>/dev/null) || return 0
+  [[ $url =~ ^https://github.com/xiangwan6667/mmwx-installer/releases/tag/v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]] || return 0
+  version=${BASH_REMATCH[1]}
+  [[ $SCRIPT_VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 0
+  [[ $version != "$SCRIPT_VERSION" ]] || return 0
+  newest=$(printf '%s\n%s\n' "$SCRIPT_VERSION" "$version" | LC_ALL=C sort -V | tail -n 1) || return 0
+  if [[ $newest == "$version" ]]; then SCRIPT_UPDATE_VERSION=v$version; fi
+  return 0
+}
 download_installer_release() {
   local directory=$1 base=https://github.com/xiangwan6667/mmwx-installer url tag expected actual
   # Resolve latest once, then pin BOTH assets to that stable release. This uses
@@ -2051,6 +2070,7 @@ usage() {
 安装需确认新 SSH 连接；check 只检查环境，不修改系统。
 reinstall 重新拉取当前版本镜像，仅重建妙妙屋容器，保留全部数据和配置。
 self-update 从最新正式 Release 更新管理脚本，并校验 SHA-256。
+打开管理菜单时自动检测脚本新版本；检测失败不影响使用，菜单 9 手动更新。
 trace 查看最近任务及失败原因；trace-follow 实时追踪；log-menu 打开日志与诊断。
 caddy 打开网关管理菜单；caddy-token --cf-token-file /root/token 替换 Token。
 caddy-status / caddy-logs / caddy-reload / caddy-restart / caddy-certificates 可直接执行。
@@ -2320,6 +2340,7 @@ menu_header() {
   printf '  主控  %s\n' "$version"
   [[ -z $domain ]] || printf '  访问  https://%s\n' "$domain"
   [[ -z $task ]] || printf '  任务  %s（菜单 5）\n' "$task"
+  [[ -z $SCRIPT_UPDATE_VERSION ]] || printf '  脚本  发现新版本 %s（菜单 9 更新）\n' "$SCRIPT_UPDATE_VERSION"
   printf '\n'
 }
 menu() {
@@ -2330,6 +2351,7 @@ menu() {
   [[ -z $PREFIX ]] || arguments+=(--prefix "$PREFIX")
   [[ -z $ZONE_NAME ]] || arguments+=(--zone "$ZONE_NAME")
   [[ -z $CHANNEL ]] || arguments+=(--channel "$CHANNEL")
+  check_script_update
   while true; do
     menu_header
     printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n    7  强制重新安装\n\n  管理\n    8  Caddy 管理\n    9  更新管理脚本\n   10  卸载服务\n   11  卸载管理脚本\n\n    0  退出\n\n'

@@ -41,7 +41,7 @@ if confirm 'Test'; then echo 'Negative confirmation accepted'; exit 1; fi
 printf '\n' > "$tmp/answers"
 if confirm 'Test'; then echo 'Empty confirmation accepted'; exit 1; fi
 printf '0\n' > "$tmp/answers"
-menu > "$tmp/menu"
+(curl() { return 7; }; menu) > "$tmp/menu"
 grep -q '继续任务 / 恢复服务' "$tmp/menu"
 DOMAIN=panel.example.com APP_IMAGE=example/app@sha256:abc CADDY_IMAGE=example/caddy@sha256:def PG_IMAGE=postgres:18-alpine
 ROOT=$tmp
