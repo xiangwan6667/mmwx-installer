@@ -9,7 +9,7 @@
 
 </div>
 
-通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.1**。
+通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.2**。
 
 ## 功能
 

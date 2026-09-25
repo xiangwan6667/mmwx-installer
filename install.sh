@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.1
+SCRIPT_VERSION=0.2.2
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -946,6 +946,13 @@ self_update() {
   fi
   if [[ -e /usr/local/bin/mmwx || -L /usr/local/bin/mmwx ]]; then
     [[ $(readlink -f /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]] || { rm -f "$downloaded"; die '已有其他 mmwx 命令。'; }
+  fi
+  if cmp -s "$downloaded" /usr/local/sbin/mmwx-installer; then
+    rm -f "$downloaded"
+    [[ -L /usr/local/bin/mmwx ]] || ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx
+    cleanup_downloads
+    info '已经是最新版。'
+    return 0
   fi
   staged=$(mktemp /usr/local/sbin/.mmwx-installer.XXXXXX)
   install -m 0700 "$downloaded" "$staged"
