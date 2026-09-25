@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 source ./install.sh
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 ROOT=$tmp
+mkdir -p "$ROOT/config" "$ROOT/state"
 if (
   install_command() { :; }
   install_stack() { echo unsafe-install > "$ROOT/unexpected"; }
@@ -11,13 +12,13 @@ if (
 ) >/dev/null 2>&1; then echo 'Resume on fresh host accepted'; exit 1; fi
 [[ ! -f $ROOT/unexpected ]]
 DOMAIN=panel.example.com CHANNEL=stable VERSION=v1 APP_IMAGE=app:v1 CADDY_IMAGE=caddy:test
-printf 'test-token' > "$ROOT/cloudflare.token"
+printf 'test-token' > "$ROOT/config/cloudflare.token"
 prepare_secrets
-first=$(cat "$ROOT/postgres.env")
-rm "$ROOT/app.env"
+first=$(cat "$ROOT/config/postgres.env")
+rm "$ROOT/config/app.env"
 prepare_secrets
-[[ $(cat "$ROOT/postgres.env") == "$first" ]]
-[[ $(cut -d= -f2 "$ROOT/app.env") == "${first#*=}" ]]
+[[ $(cat "$ROOT/config/postgres.env") == "$first" ]]
+[[ $(cut -d= -f2 "$ROOT/config/app.env") == "${first#*=}" ]]
 checkpoint 3
 DOMAIN='' CHANNEL='' VERSION=''
 load_progress
@@ -28,6 +29,7 @@ cat > "$tmp/harness.sh" <<'EOF'
 set -euo pipefail
 source ./install.sh
 ROOT=$TEST_ROOT
+mkdir -p "$ROOT/config" "$ROOT/state"
 preflight() { :; }
 install_command() { :; }
 configure_timezone() { :; }
@@ -44,9 +46,9 @@ verify_https() { :; }
 install_stack
 EOF
 if TEST_ROOT=$tmp PHASE=interrupted bash "$tmp/harness.sh" >/dev/null; then echo 'Interruption not propagated'; exit 1; else [[ $? == 42 ]]; fi
-[[ $(jq -r .stage "$ROOT/progress.json") == 3 ]]
+[[ $(jq -r .stage "$ROOT/state/progress.json") == 3 ]]
 TEST_ROOT=$tmp PHASE=resume bash "$tmp/harness.sh" >/dev/null
-[[ $(jq -r .stage "$ROOT/progress.json") == 7 ]]
-[[ $(cat "$ROOT/postgres.env") == "$first" ]]
+[[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]]
+[[ $(cat "$ROOT/config/postgres.env") == "$first" ]]
 [[ $(cat "$ROOT/calls") == network-checked ]]
 echo 'PASS: interrupted install resumes, preserves credentials and rechecks networking'

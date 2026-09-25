@@ -12,6 +12,7 @@ fi
 ROOT=/root/mmwx-installer-smoke
 [[ ! -e $ROOT ]] || die 'Smoke directory already exists; inspect it before retrying.'
 mkdir -m 700 "$ROOT"
+mkdir -p "$ROOT/config" "$ROOT/state"
 cleanup() { docker compose -p mmwx-smoke -f "$ROOT/compose.json" down 2>/dev/null || true; }
 trap cleanup EXIT
 DOMAIN=localhost
@@ -20,12 +21,12 @@ choose_version
 CADDY_IMAGE=mmwx-installer-caddy:2.11.4-cf0.2.4
 PG_IMAGE=postgres:18-alpine
 password=$(openssl rand -hex 24)
-printf 'MMWX_DATABASE_PASSWORD=%s\n' "$password" > "$ROOT/app.env"
-printf 'POSTGRES_PASSWORD=%s\n' "$password" > "$ROOT/postgres.env"
-touch "$ROOT/caddy.env"
-render_compose > "$ROOT/compose.yaml"
-printf ':80 {\n reverse_proxy mmwx:12889\n}\n' > "$ROOT/Caddyfile"
-docker compose -p mmwx-smoke -f "$ROOT/compose.yaml" config --format json | jq '.services.caddy.ports=[{target:80,published:"18080",host_ip:"127.0.0.1",protocol:"tcp"}] | (.services[].restart)="no"' > "$ROOT/compose.json"
+printf 'MMWX_DATABASE_PASSWORD=%s\n' "$password" > "$ROOT/config/app.env"
+printf 'POSTGRES_PASSWORD=%s\n' "$password" > "$ROOT/config/postgres.env"
+touch "$ROOT/config/caddy.env"
+render_compose > "$ROOT/config/compose.yaml"
+printf ':80 {\n reverse_proxy mmwx:12889\n}\n' > "$ROOT/config/Caddyfile"
+docker compose -p mmwx-smoke -f "$ROOT/config/compose.yaml" config --format json | jq '.services.caddy.ports=[{target:80,published:"18080",host_ip:"127.0.0.1",protocol:"tcp"}] | (.services[].restart)="no"' > "$ROOT/compose.json"
 docker compose -p mmwx-smoke -f "$ROOT/compose.json" up -d --wait --wait-timeout 300
 curl -fsS http://127.0.0.1:18080/ -o /dev/null
 echo 'PASS: official stable image, PostgreSQL and Caddy bridge proxy'

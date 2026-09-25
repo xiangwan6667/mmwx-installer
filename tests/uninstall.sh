@@ -4,7 +4,8 @@ cd "$(dirname "$0")/.."
 source ./install.sh
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 ROOT=$tmp
-printf '{}' > "$ROOT/state.json"
+mkdir -p "$ROOT/config" "$ROOT/state"
+printf '{}' > "$ROOT/state/state.json"
 printf 'data-to-keep' > "$ROOT/sentinel"
 load_state() { :; }
 ask() { printf '%s' "$CHOICE"; }

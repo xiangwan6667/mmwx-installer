@@ -58,10 +58,14 @@ root 用户直接运行 `mmwx`。
 
 | 目录（位于 `/opt/mmwx-installer`） | 内容 |
 | --- | --- |
-| `postgres-data/` | PostgreSQL 数据 |
-| `data/`、`subscribes/`、`rule_templates/` | 应用文件 |
-| `caddy-data/`、`caddy-config/` | 证书及 Caddy 状态 |
+| `config/` | Compose、环境变量、Caddy 配置及 Token |
+| `data/postgres/` | PostgreSQL 数据 |
+| `data/app/`、`data/subscribes/`、`data/rule_templates/` | 应用文件 |
+| `certs/` | 证书及 Caddy 状态 |
 | `backups/` | 更新前备份 |
+| `state/` | 安装进度、版本记录及网络恢复配置 |
+
+旧版目录会在恢复服务时自动整理，迁移期间短暂停止容器，原有数据直接迁移，不重新初始化。
 
 - **保留数据**：移除容器及本项目防火墙规则，保留数据和管理命令；菜单 5 可恢复。
 - **完全卸载**：同时删除上述目录、备份、保存的 Token 和管理命令，需再次确认。

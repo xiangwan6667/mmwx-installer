@@ -11,6 +11,7 @@ jobs:
       - run: bash -n install.sh && shellcheck install.sh tests/*.sh
       - run: sudo bash tests/test.sh && sudo bash tests/lifecycle.sh && sudo bash tests/resume.sh && sudo bash tests/update-resume.sh && sudo bash tests/dns.sh
       - run: sudo bash tests/firewall-migration.sh && sudo bash tests/uninstall.sh && sudo bash tests/management.sh
+      - run: sudo bash tests/layout.sh
   runtime:
     runs-on: ubuntu-latest
     timeout-minutes: 10

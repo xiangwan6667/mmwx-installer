@@ -6,7 +6,8 @@ cd "$(dirname "$0")/.."
 source ./install.sh
 [[ ! -e $ROOT ]] || die 'Firewall test directory already exists.'
 mkdir -m 700 "$ROOT"
-printf '173.245.48.0/20\n' > "$ROOT/cloudflare-v4.txt"
+mkdir -p "$ROOT/config" "$ROOT/state"
+printf '173.245.48.0/20\n' > "$ROOT/state/cloudflare-v4.txt"
 cleanup() {
   docker rm -f mmwx-firewall-test >/dev/null 2>&1 || true
   docker network rm mmwx-firewall-test >/dev/null 2>&1 || true

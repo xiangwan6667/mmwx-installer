@@ -26,7 +26,73 @@ join_domain() {
   printf '%s.%s\n' "$1" "$2"
 }
 get() { curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 90 --retry 2 "$@"; }
-dc() { docker compose --project-name mmwx-installer --project-directory "$ROOT" -f "$ROOT/compose.yaml" "$@"; }
+dc() { docker compose --project-name mmwx-installer --project-directory "$ROOT/config" -f "$ROOT/config/compose.yaml" "$@"; }
+ensure_layout() {
+  local name pair source target
+  if [[ -f $ROOT/state.json || -f $ROOT/progress.json || -d $ROOT/.layout-migration ]]; then
+    [[ ! -L $ROOT ]] || die '安装目录不能是符号链接。'
+    info '整理项目目录，迁移原数据……'
+    mkdir -p "$ROOT/.layout-migration"
+    install_command
+    systemctl stop mmwx-cf-sync.timer mmwx-cf-sync.service 2>/dev/null || true
+    if [[ -f $ROOT/network-backup/state && $(cat "$ROOT/network-backup/state") == pending ]]; then
+      systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
+      /bin/bash "$ROOT/network-backup/rollback.sh"
+    fi
+    if [[ -f $ROOT/compose.yaml ]]; then
+      if [[ -n $(docker compose -p mmwx-installer --project-directory "$ROOT" -f "$ROOT/compose.yaml" ps --status running -q) ]]; then
+        touch "$ROOT/.layout-migration/was-running"
+      fi
+      docker compose -p mmwx-installer --project-directory "$ROOT" -f "$ROOT/compose.yaml" down
+    fi
+    # The old app directory was named data; stage it before creating the new data parent.
+    if [[ ! -f $ROOT/.layout-migration/app-staged ]]; then
+      if [[ -d $ROOT/data ]]; then
+        [[ ! -e $ROOT/.legacy-app ]] || die '发现重复应用目录，停止迁移。'
+        mv "$ROOT/data" "$ROOT/.legacy-app"
+      fi
+      touch "$ROOT/.layout-migration/app-staged"
+    fi
+    mkdir -p "$ROOT/config" "$ROOT/data" "$ROOT/certs" "$ROOT/state" "$ROOT/backups"
+    for pair in '.legacy-app:data/app' 'postgres-data:data/postgres' 'subscribes:data/subscribes' 'rule_templates:data/rule_templates' 'caddy-data:certs/data' 'caddy-config:certs/config'; do
+      source=$ROOT/${pair%%:*}; target=$ROOT/${pair#*:}
+      if [[ -e $source ]]; then
+        [[ ! -e $target ]] || die "新旧目录同时存在：$target，停止迁移。"
+        mv "$source" "$target"
+      fi
+    done
+    for name in compose.yaml Caddyfile postgres.env app.env caddy.env cloudflare.token; do
+      if [[ -f $ROOT/$name ]]; then
+        [[ ! -e $ROOT/config/$name ]] || die "配置冲突：$name"
+        mv "$ROOT/$name" "$ROOT/config/$name"
+      fi
+    done
+    for name in state.json progress.json update.json image-rollback.json cloudflare-v4.txt network-backup; do
+      if [[ -e $ROOT/$name ]]; then
+        [[ ! -e $ROOT/state/$name ]] || die "状态冲突：$name"
+        mv "$ROOT/$name" "$ROOT/state/$name"
+      fi
+    done
+    if [[ -f $ROOT/state/network-backup/rollback.sh ]]; then
+      # shellcheck disable=SC2016
+      sed -i 's|\$root/network-backup|$root/state/network-backup|g' "$ROOT/state/network-backup/rollback.sh"
+    fi
+    if [[ -f $ROOT/config/compose.yaml ]]; then
+      if [[ -f $ROOT/state/state.json ]]; then load_state; else load_progress; fi
+      render_compose > "$ROOT/config/compose.yaml.tmp"
+      mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
+    fi
+    if [[ -f $ROOT/.layout-migration/was-running && -f $ROOT/state/state.json && ! -f $ROOT/state/update.json && ! -f $ROOT/state/image-rollback.json ]]; then
+      configure_timezone
+      install_units
+      apply_firewall
+      dc up -d --wait --wait-timeout 300
+    fi
+    mv "$ROOT/.layout-migration" "$ROOT/state/layout-v2"
+    info '目录迁移完成。'
+  fi
+  mkdir -p "$ROOT/config" "$ROOT/data" "$ROOT/certs" "$ROOT/state" "$ROOT/backups"
+}
 valid_domain() {
   [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ && ${#1} -le 253 ]]
 }
@@ -99,12 +165,12 @@ services:
     image: $CADDY_IMAGE
     restart: unless-stopped
     ports: ["0.0.0.0:80:80/tcp", "0.0.0.0:443:443/tcp"]
-    env_file: [caddy.env]
+    env_file: ["$ROOT/config/caddy.env"]
     environment: {TZ: Asia/Shanghai}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./caddy-data:/data
-      - ./caddy-config:/config
+      - $ROOT/config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - $ROOT/certs/data:/data
+      - $ROOT/certs/config:/config
       - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
       - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
     networks: [frontend]
@@ -113,7 +179,7 @@ services:
   mmwx:
     image: $APP_IMAGE
     restart: unless-stopped
-    env_file: [app.env]
+    env_file: ["$ROOT/config/app.env"]
     environment:
       TZ: Asia/Shanghai
       PORT: "12889"
@@ -124,9 +190,9 @@ services:
       MMWX_DATABASE_USER: mmwx
       MMWX_DATABASE_SSLMODE: disable
     volumes:
-      - ./data:/app/data
-      - ./subscribes:/app/subscribes
-      - ./rule_templates:/app/rule_templates
+      - $ROOT/data/app:/app/data
+      - $ROOT/data/subscribes:/app/subscribes
+      - $ROOT/data/rule_templates:/app/rule_templates
       - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
       - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
     networks: [frontend, database]
@@ -141,11 +207,11 @@ services:
   postgres:
     image: $PG_IMAGE
     restart: unless-stopped
-    env_file: [postgres.env]
+    env_file: ["$ROOT/config/postgres.env"]
     environment: {POSTGRES_DB: mmwx, POSTGRES_USER: mmwx, TZ: Asia/Shanghai, PGTZ: Asia/Shanghai}
     command: [postgres, -c, timezone=Asia/Shanghai, -c, log_timezone=Asia/Shanghai]
     volumes:
-      - ./postgres-data:/var/lib/postgresql
+      - $ROOT/data/postgres:/var/lib/postgresql
       - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
       - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
     networks: [database]
@@ -168,9 +234,9 @@ EOF
 }
 render_caddy() {
   local proxies=''
-  if [[ -f $ROOT/cloudflare-v4.txt ]]; then
-    validate_cidrs < "$ROOT/cloudflare-v4.txt"
-    proxies="trusted_proxies static $(tr '\n' ' ' < "$ROOT/cloudflare-v4.txt")"
+  if [[ -f $ROOT/state/cloudflare-v4.txt ]]; then
+    validate_cidrs < "$ROOT/state/cloudflare-v4.txt"
+    proxies="trusted_proxies static $(tr '\n' ' ' < "$ROOT/state/cloudflare-v4.txt")"
   fi
   cat <<EOF
 {
@@ -204,9 +270,9 @@ preflight() {
     local foreign
     foreign=$(docker ps -a --format '{{.Names}} {{.Label "com.docker.compose.project"}}' | awk '$2 != "mmwx-installer" {print $1}')
     [[ -z $foreign ]] || die "发现其他容器：$foreign。仅支持全新环境。"
-    if [[ ! -f $ROOT/state.json && ! -f $ROOT/progress.json ]] && [[ -n $(docker ps -aq) ]]; then die '发现已有容器，停止安装。'; fi
+    if [[ ! -f $ROOT/state/state.json && ! -f $ROOT/state/progress.json ]] && [[ -n $(docker ps -aq) ]]; then die '发现已有容器，停止安装。'; fi
   fi
-  if [[ ! -f $ROOT/state.json ]]; then
+  if [[ ! -f $ROOT/state/state.json ]]; then
     for service in nginx caddy apache2 httpd mmwx postgresql; do
       if systemctl list-unit-files --no-legend "$service.service" 2>/dev/null | grep -q "^$service.service"; then
         die "发现已有服务 $service，请使用全新环境。"
@@ -217,7 +283,7 @@ preflight() {
     if [[ -e /usr/local/bin/mmwx || -L /usr/local/bin/mmwx ]]; then
       [[ $(readlink -f /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]] || die '发现已有 mmwx 命令。'
     fi
-    [[ ! -e $ROOT/compose.yaml || -f $ROOT/progress.json ]] || die "发现未知安装文件：$ROOT。"
+    [[ ! -e $ROOT/config/compose.yaml || -f $ROOT/state/progress.json ]] || die "发现未知安装文件：$ROOT。"
   fi
 }
 dependencies() {
@@ -378,7 +444,9 @@ fetch_cf() {
   mv "$tmp" "$target"
 }
 apply_firewall() {
-  local ranges=$ROOT/cloudflare-v4.txt cidr
+  local ranges=$ROOT/state/cloudflare-v4.txt cidr
+  # An updated manager must still allow Docker to start before legacy layout migration.
+  [[ -f $ranges ]] || ranges=$ROOT/cloudflare-v4.txt
   validate_cidrs < "$ranges"
   iptables -N DOCKER-USER 2>/dev/null || true
   ipset create mmwx_cf_next hash:net family inet -exist
@@ -402,6 +470,7 @@ EOF
 remove_legacy_cf_rules() {
   # Delete only this installer's old UFW web permits. Descending numbers avoid renumbering errors.
   local numbers number
+  command -v ufw >/dev/null || return 0
   numbers=$(LC_ALL=C ufw status numbered | sed -nE 's/^\[[[:space:]]*([0-9]+)\][[:space:]]+80,443\/tcp[[:space:]]+ALLOW IN[[:space:]]+.*[[:space:]]#[[:space:]]mmwx-cf[[:space:]]*$/\1/p' | sort -rn)
   while IFS= read -r number; do
     [[ -n $number ]] || continue
@@ -410,67 +479,67 @@ remove_legacy_cf_rules() {
 }
 sync_cf() {
   exec 8>/run/mmwx-cf.lock; flock -n 8 || exit 0
-  local old=$ROOT/cloudflare-v4.txt new=$ROOT/cloudflare-v4.new
+  local old=$ROOT/state/cloudflare-v4.txt new=$ROOT/state/cloudflare-v4.new
   fetch_cf "$new" || { printf 'Cloudflare IP 更新失败，保留现有规则。\n' >&2; return 1; }
   mv "$new" "$old"
   apply_firewall
   remove_legacy_cf_rules
-  if [[ -f $ROOT/state.json ]]; then
-    DOMAIN=$(jq -er .domain "$ROOT/state.json")
-    render_caddy > "$ROOT/Caddyfile.next"
+  if [[ -f $ROOT/state/state.json ]]; then
+    DOMAIN=$(jq -er .domain "$ROOT/state/state.json")
+    render_caddy > "$ROOT/config/Caddyfile.next"
     # Keep the inode: Caddy mounts this individual file.
-    cat "$ROOT/Caddyfile.next" > "$ROOT/Caddyfile"
-    rm -f "$ROOT/Caddyfile.next"
+    cat "$ROOT/config/Caddyfile.next" > "$ROOT/config/Caddyfile"
+    rm -f "$ROOT/config/Caddyfile.next"
     if [[ -n $(dc ps --status running -q caddy) ]]; then dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null; fi
   fi
 }
 network_setup() {
   local port
-  if [[ -f $ROOT/network-backup/state ]]; then
-    if [[ $(cat "$ROOT/network-backup/state") == confirmed ]]; then
+  if [[ -f $ROOT/state/network-backup/state ]]; then
+    if [[ $(cat "$ROOT/state/network-backup/state") == confirmed ]]; then
       network_is_ready || die '已确认的网络设置发生变化，请检查 UFW/IPv6 后继续。'
       apply_firewall
       remove_legacy_cf_rules
       return
     fi
-    if [[ $(cat "$ROOT/network-backup/state") == pending ]]; then
+    if [[ $(cat "$ROOT/state/network-backup/state") == pending ]]; then
       systemctl stop mmwx-network-rollback.timer 2>/dev/null || true
-      /bin/bash "$ROOT/network-backup/rollback.sh"
+      /bin/bash "$ROOT/state/network-backup/rollback.sh"
     fi
     systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
     systemctl reset-failed mmwx-network-rollback.service 2>/dev/null || true
   fi
   SSH_PORTS=$(ss -H -lntp | awk '/sshd/ {n=split($4,a,":"); print a[n]}' | sort -nu)
   [[ -n $SSH_PORTS ]] || die '无法识别 sshd 监听端口，停止网络修改。'
-  install -d "$ROOT/network-backup"
-  if [[ ! -f $ROOT/network-backup/ufw-status ]]; then
-    cp -a /etc/ufw "$ROOT/network-backup/ufw"
-    cp -a /etc/default/ufw "$ROOT/network-backup/ufw-default"
-    for port in all default lo; do sysctl -n "net.ipv6.conf.$port.disable_ipv6" > "$ROOT/network-backup/ipv6-$port"; done
-    ufw status | head -1 > "$ROOT/network-backup/ufw-status"
+  install -d "$ROOT/state/network-backup"
+  if [[ ! -f $ROOT/state/network-backup/ufw-status ]]; then
+    cp -a /etc/ufw "$ROOT/state/network-backup/ufw"
+    cp -a /etc/default/ufw "$ROOT/state/network-backup/ufw-default"
+    for port in all default lo; do sysctl -n "net.ipv6.conf.$port.disable_ipv6" > "$ROOT/state/network-backup/ipv6-$port"; done
+    ufw status | head -1 > "$ROOT/state/network-backup/ufw-status"
   fi
-  fetch_cf "$ROOT/cloudflare-v4.txt" || die 'Cloudflare IP 列表获取失败。'
+  fetch_cf "$ROOT/state/cloudflare-v4.txt" || die 'Cloudflare IP 列表获取失败。'
   install_units
   for port in $SSH_PORTS; do ufw allow "$port/tcp" comment mmwx-ssh; done
   # Schedule recovery before changing networking; cancelled only after operator acknowledgement.
-  cat > "$ROOT/network-backup/rollback.sh" <<'EOF'
+  cat > "$ROOT/state/network-backup/rollback.sh" <<'EOF'
 #!/bin/bash
 set -eu
 root=/opt/mmwx-installer
 exec 9>/run/mmwx-network.lock
 flock 9
-test "$(cat "$root/network-backup/state")" != confirmed || exit 0
-printf 'rolled-back\n' > "$root/network-backup/state"
+test "$(cat "$root/state/network-backup/state")" != confirmed || exit 0
+printf 'rolled-back\n' > "$root/state/network-backup/state"
 ufw disable
-cp -a "$root/network-backup/ufw/." /etc/ufw/
-cp -a "$root/network-backup/ufw-default" /etc/default/ufw
+cp -a "$root/state/network-backup/ufw/." /etc/ufw/
+cp -a "$root/state/network-backup/ufw-default" /etc/default/ufw
 rm -f /etc/sysctl.d/90-mmwx-ipv4-only.conf
-for interface in all default lo; do sysctl -w "net.ipv6.conf.$interface.disable_ipv6=$(cat "$root/network-backup/ipv6-$interface")"; done
-if grep -qx 'Status: active' "$root/network-backup/ufw-status"; then ufw --force enable; fi
+for interface in all default lo; do sysctl -w "net.ipv6.conf.$interface.disable_ipv6=$(cat "$root/state/network-backup/ipv6-$interface")"; done
+if grep -qx 'Status: active' "$root/state/network-backup/ufw-status"; then ufw --force enable; fi
 EOF
-  chmod 700 "$ROOT/network-backup/rollback.sh"
-  printf 'pending\n' > "$ROOT/network-backup/state"
-  systemd-run --collect --unit=mmwx-network-rollback --on-active=5m /bin/bash "$ROOT/network-backup/rollback.sh"
+  chmod 700 "$ROOT/state/network-backup/rollback.sh"
+  printf 'pending\n' > "$ROOT/state/network-backup/state"
+  systemd-run --collect --unit=mmwx-network-rollback --on-active=5m /bin/bash "$ROOT/state/network-backup/rollback.sh"
   cat > /etc/sysctl.d/90-mmwx-ipv4-only.conf <<'EOF'
 net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
@@ -491,11 +560,11 @@ EOF
     info '新终端运行 mmwx，在菜单中确认 SSH。'
     local attempt
     for ((attempt=0; attempt<56; attempt++)); do
-      [[ $(cat "$ROOT/network-backup/state") == confirmed ]] && break
-      [[ $(cat "$ROOT/network-backup/state") != rolled-back ]] || die '网络已自动恢复，安装停止。'
+      [[ $(cat "$ROOT/state/network-backup/state") == confirmed ]] && break
+      [[ $(cat "$ROOT/state/network-backup/state") != rolled-back ]] || die '网络已自动恢复，安装停止。'
       sleep 5
     done
-    [[ $(cat "$ROOT/network-backup/state") == confirmed ]] || die '未在期限内确认新 SSH，安装停止并等待网络回退。'
+    [[ $(cat "$ROOT/state/network-backup/state") == confirmed ]] || die '未在期限内确认新 SSH，安装停止并等待网络回退。'
   fi
 }
 network_is_ready() {
@@ -504,11 +573,11 @@ network_is_ready() {
 }
 confirm_network() {
   exec 9>/run/mmwx-network.lock; flock 9
-  [[ -f $ROOT/network-backup/state && $(cat "$ROOT/network-backup/state") == pending ]] || die '没有待确认的网络变更，或网络已回退。'
+  [[ -f $ROOT/state/network-backup/state && $(cat "$ROOT/state/network-backup/state") == pending ]] || die '没有待确认的网络变更，或网络已回退。'
   systemctl is-active --quiet mmwx-network-rollback.timer || die '网络确认期限已过。'
   [[ ${SSH_CONNECTION:-} != *:* ]] || die '请通过 IPv4 SSH 确认。'
   network_is_ready || die '网络状态不符合预期，请等待回退。'
-  printf 'confirmed\n' > "$ROOT/network-backup/state"
+  printf 'confirmed\n' > "$ROOT/state/network-backup/state"
   systemctl stop mmwx-network-rollback.timer
   systemctl reset-failed mmwx-network-rollback.service 2>/dev/null || true
   flock -u 9
@@ -563,8 +632,8 @@ EOF
   systemctl enable --now mmwx-cf-sync.timer
 }
 save_state() {
-  jq -n --arg domain "$DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{domain:$domain,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/state.json.tmp"
-  mv "$ROOT/state.json.tmp" "$ROOT/state.json"
+  jq -n --arg domain "$DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{domain:$domain,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/state/state.json.tmp"
+  mv "$ROOT/state/state.json.tmp" "$ROOT/state/state.json"
 }
 verify_https() {
   local attempt
@@ -578,56 +647,57 @@ verify_https() {
   die '容器已启动，但 HTTPS 验证未通过。检查 Caddy 日志、Token、Cloudflare Full (strict) 和安全组，不能视为安装成功。'
 }
 load_state() {
-  [[ -f $ROOT/state.json ]] || die '未发现本安装器的安装记录。'
-  DOMAIN=$(jq -er .domain "$ROOT/state.json")
-  CHANNEL=${CHANNEL:-$(jq -er .channel "$ROOT/state.json")}
-  VERSION=$(jq -er .version "$ROOT/state.json")
-  APP_IMAGE=$(jq -er .app "$ROOT/state.json")
-  CADDY_IMAGE=$(jq -er .caddy "$ROOT/state.json")
-  PG_IMAGE=$(jq -er .pg "$ROOT/state.json")
+  [[ -f $ROOT/state/state.json ]] || die '未发现本安装器的安装记录。'
+  DOMAIN=$(jq -er .domain "$ROOT/state/state.json")
+  CHANNEL=${CHANNEL:-$(jq -er .channel "$ROOT/state/state.json")}
+  VERSION=$(jq -er .version "$ROOT/state/state.json")
+  APP_IMAGE=$(jq -er .app "$ROOT/state/state.json")
+  CADDY_IMAGE=$(jq -er .caddy "$ROOT/state/state.json")
+  PG_IMAGE=$(jq -er .pg "$ROOT/state/state.json")
 }
 checkpoint() {
   STAGE=$1
-  jq -n --argjson stage "$STAGE" --arg domain "$DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{stage:$stage,domain:$domain,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/progress.json.tmp"
-  mv "$ROOT/progress.json.tmp" "$ROOT/progress.json"
+  jq -n --argjson stage "$STAGE" --arg domain "$DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{stage:$stage,domain:$domain,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/state/progress.json.tmp"
+  mv "$ROOT/state/progress.json.tmp" "$ROOT/state/progress.json"
 }
 load_progress() {
-  jq -e '.stage|type=="number" and .>=0 and .<=7' "$ROOT/progress.json" >/dev/null || die '安装进度异常。'
-  STAGE=$(jq -r .stage "$ROOT/progress.json")
-  DOMAIN=$(jq -r '.domain // ""' "$ROOT/progress.json")
-  CHANNEL=$(jq -r '.channel // ""' "$ROOT/progress.json")
-  VERSION=$(jq -r '.version // ""' "$ROOT/progress.json")
-  APP_IMAGE=$(jq -r '.app // ""' "$ROOT/progress.json")
-  CADDY_IMAGE=$(jq -r '.caddy // ""' "$ROOT/progress.json")
-  PG_IMAGE=$(jq -r '.pg // "postgres:18-alpine"' "$ROOT/progress.json")
+  jq -e '.stage|type=="number" and .>=0 and .<=7' "$ROOT/state/progress.json" >/dev/null || die '安装进度异常。'
+  STAGE=$(jq -r .stage "$ROOT/state/progress.json")
+  DOMAIN=$(jq -r '.domain // ""' "$ROOT/state/progress.json")
+  CHANNEL=$(jq -r '.channel // ""' "$ROOT/state/progress.json")
+  VERSION=$(jq -r '.version // ""' "$ROOT/state/progress.json")
+  APP_IMAGE=$(jq -r '.app // ""' "$ROOT/state/progress.json")
+  CADDY_IMAGE=$(jq -r '.caddy // ""' "$ROOT/state/progress.json")
+  PG_IMAGE=$(jq -r '.pg // "postgres:18-alpine"' "$ROOT/state/progress.json")
 }
 prepare_secrets() {
   local password
-  if [[ -f $ROOT/postgres.env ]]; then
-    password=$(sed -n 's/^POSTGRES_PASSWORD=//p' "$ROOT/postgres.env")
+  if [[ -f $ROOT/config/postgres.env ]]; then
+    password=$(sed -n 's/^POSTGRES_PASSWORD=//p' "$ROOT/config/postgres.env")
     [[ $password =~ ^[a-f0-9]{64}$ ]] || die '数据库密码文件格式异常，未覆盖。'
   else
-    [[ ! -d $ROOT/postgres-data ]] || die '存在数据库数据但密码文件丢失，停止操作。'
+    [[ ! -d $ROOT/data/postgres ]] || die '存在数据库数据但密码文件丢失，停止操作。'
     password=$(openssl rand -hex 32)
-    printf 'POSTGRES_PASSWORD=%s\n' "$password" > "$ROOT/postgres.env.tmp"
-    mv "$ROOT/postgres.env.tmp" "$ROOT/postgres.env"
+    printf 'POSTGRES_PASSWORD=%s\n' "$password" > "$ROOT/config/postgres.env.tmp"
+    mv "$ROOT/config/postgres.env.tmp" "$ROOT/config/postgres.env"
   fi
-  printf 'MMWX_DATABASE_PASSWORD=%s\n' "$password" > "$ROOT/app.env.tmp"
-  mv "$ROOT/app.env.tmp" "$ROOT/app.env"
-  if [[ ! -f $ROOT/caddy.env ]]; then
-    [[ -f $ROOT/cloudflare.token ]] || die '缺少 Token，请重新提供。'
-    printf 'CF_API_TOKEN=%s\n' "$(cat "$ROOT/cloudflare.token")" > "$ROOT/caddy.env.tmp"
-    mv "$ROOT/caddy.env.tmp" "$ROOT/caddy.env"
+  printf 'MMWX_DATABASE_PASSWORD=%s\n' "$password" > "$ROOT/config/app.env.tmp"
+  mv "$ROOT/config/app.env.tmp" "$ROOT/config/app.env"
+  if [[ ! -f $ROOT/config/caddy.env ]]; then
+    [[ -f $ROOT/config/cloudflare.token ]] || die '缺少 Token，请重新提供。'
+    printf 'CF_API_TOKEN=%s\n' "$(cat "$ROOT/config/cloudflare.token")" > "$ROOT/config/caddy.env.tmp"
+    mv "$ROOT/config/caddy.env.tmp" "$ROOT/config/caddy.env"
   fi
 }
 install_stack() {
+  ensure_layout
   preflight
-  [[ ! -f $ROOT/update.json ]] || die '有未完成的更新，请选择「继续任务 / 恢复服务」。'
-  if [[ -f $ROOT/progress.json ]]; then
+  [[ ! -f $ROOT/state/update.json ]] || die '有未完成的更新，请选择「继续任务 / 恢复服务」。'
+  if [[ -f $ROOT/state/progress.json ]]; then
     load_progress
     [[ $STAGE -lt 7 ]] || die '已安装，请在菜单选择更新或恢复服务。'
     info "继续安装（阶段 $STAGE/7）"
-  elif [[ -f $ROOT/state.json ]]; then
+  elif [[ -f $ROOT/state/state.json ]]; then
     die '已有安装，请选择恢复服务。'
   fi
   install -d -m 0700 "$ROOT"
@@ -638,7 +708,7 @@ install_stack() {
   fi
   configure_timezone
   if ((STAGE<2)); then
-    if [[ -z $TOKEN_FILE && -f $ROOT/cloudflare.token ]]; then TOKEN_FILE=$ROOT/cloudflare.token; fi
+    if [[ -z $TOKEN_FILE && -f $ROOT/config/cloudflare.token ]]; then TOKEN_FILE=$ROOT/config/cloudflare.token; fi
     if [[ -z $TOKEN_FILE ]]; then
       token_guide
       TOKEN_FILE=$(mktemp); TEMP_TOKEN=$TOKEN_FILE
@@ -647,8 +717,8 @@ install_stack() {
       printf '%s' "$token" > "$TOKEN_FILE"
     fi
     dns_check
-    printf '%s' "$CF_TOKEN" > "$ROOT/cloudflare.token.tmp"
-    mv "$ROOT/cloudflare.token.tmp" "$ROOT/cloudflare.token"
+    printf '%s' "$CF_TOKEN" > "$ROOT/config/cloudflare.token.tmp"
+    mv "$ROOT/config/cloudflare.token.tmp" "$ROOT/config/cloudflare.token"
     unset CF_TOKEN
     checkpoint 2
   fi
@@ -662,14 +732,16 @@ install_stack() {
   fi
   if ((STAGE<5)); then
     prepare_secrets
-    render_compose > "$ROOT/compose.yaml.tmp"
-    mv "$ROOT/compose.yaml.tmp" "$ROOT/compose.yaml"
-    render_caddy > "$ROOT/Caddyfile"
+    render_compose > "$ROOT/config/compose.yaml.tmp"
+    mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
+    render_caddy > "$ROOT/config/Caddyfile"
     dc config --quiet
     checkpoint 5
   fi
+  render_compose > "$ROOT/config/compose.yaml.tmp"
+  mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
   network_setup
-  render_caddy > "$ROOT/Caddyfile"
+  render_caddy > "$ROOT/config/Caddyfile"
   save_state
   checkpoint 6
   dc up -d --wait --wait-timeout 300
@@ -678,13 +750,13 @@ install_stack() {
   printf '\n安装完成：https://%s\n管理菜单：mmwx\n数据库由环境变量管理，无需勾选「使用 PG 数据库」。\n' "$DOMAIN"
 }
 write_update_progress() {
-  jq -n --arg phase "$1" --arg backup "$2" '{phase:$phase,backup:$backup}' > "$ROOT/update.json.tmp"
-  mv "$ROOT/update.json.tmp" "$ROOT/update.json"
+  jq -n --arg phase "$1" --arg backup "$2" '{phase:$phase,backup:$backup}' > "$ROOT/state/update.json.tmp"
+  mv "$ROOT/state/update.json.tmp" "$ROOT/state/update.json"
 }
 recover_update() {
   local backup phase directory
-  backup=$(jq -er .backup "$ROOT/update.json")
-  phase=$(jq -er .phase "$ROOT/update.json")
+  backup=$(jq -er .backup "$ROOT/state/update.json")
+  phase=$(jq -er .phase "$ROOT/state/update.json")
   [[ $backup == "$ROOT/backups/"* && ${backup#"$ROOT/backups/"} != */* && -d $backup ]] || die '更新备份路径异常。'
   [[ -f $backup/compose.yaml && -f $backup/state.json ]] || die '更新恢复文件缺失。'
   case "$phase" in
@@ -699,50 +771,55 @@ recover_update() {
       dc exec -T postgres pg_restore -U mmwx -d mmwx --exit-on-error < "$backup/database.dump"
       mkdir -p "$backup/restored"
       tar -xzf "$backup/files.tar.gz" -C "$backup/restored"
-      for directory in data subscribes rule_templates; do
-        if [[ -d $ROOT/$directory && ! -e $backup/failed-$directory ]]; then
-          mv "$ROOT/$directory" "$backup/failed-$directory"
+      if [[ -d $backup/restored/data && ! -e $backup/restored/app ]]; then mv "$backup/restored/data" "$backup/restored/app"; fi
+      for directory in app subscribes rule_templates; do
+        if [[ -d $ROOT/data/$directory && ! -e $backup/failed-$directory ]]; then
+          mv "$ROOT/data/$directory" "$backup/failed-$directory"
         fi
         # Fixed project-owned directories only; retry starts from the same snapshot.
-        rm -rf "${ROOT:?}/$directory"
-        cp -a "$backup/restored/$directory" "$ROOT/$directory"
+        rm -rf "${ROOT:?}/data/$directory"
+        cp -a "$backup/restored/$directory" "$ROOT/data/$directory"
       done
       ;;
     *) die '未知更新阶段。';;
   esac
-  cp "$backup/compose.yaml" "$ROOT/compose.yaml"
-  cp "$backup/state.json" "$ROOT/state.json"
+  cp "$backup/state.json" "$ROOT/state/state.json"
+  CHANNEL=''
+  load_state
+  render_compose > "$ROOT/config/compose.yaml.tmp"
+  mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
   dc up -d --wait --wait-timeout 300
-  rm -f "$ROOT/update.json"
+  rm -f "$ROOT/state/update.json"
   info "已恢复更新前的版本。备份：$backup"
 }
 update_stack() {
+  ensure_layout
   preflight
   install_command
-  if [[ -f $ROOT/update.json ]]; then recover_update; return; fi
-  [[ ! -f $ROOT/image-rollback.json ]] || die '请先继续未完成的版本回退。'
-  [[ ! -f $ROOT/progress.json ]] || [[ $(jq -r .stage "$ROOT/progress.json") == 7 ]] || die '请先继续完成安装。'
+  if [[ -f $ROOT/state/update.json ]]; then recover_update; return; fi
+  [[ ! -f $ROOT/state/image-rollback.json ]] || die '请先继续未完成的版本回退。'
+  [[ ! -f $ROOT/state/progress.json ]] || [[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]] || die '请先继续完成安装。'
   load_state
   configure_timezone
   local backup
   choose_version
   mkdir -p "$ROOT/backups"
   backup=$(mktemp -d "$ROOT/backups/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
-  cp "$ROOT/compose.yaml" "$ROOT/state.json" "$backup/"
+  cp "$ROOT/config/compose.yaml" "$ROOT/state/state.json" "$backup/"
   write_update_progress backing-up "$backup"
   dc stop mmwx caddy
   if ! dc exec -T postgres pg_dump -U mmwx -d mmwx -Fc > "$backup/database.dump"; then
-    dc start mmwx caddy; rm -f "$ROOT/update.json"; die '数据库备份失败，已重新启动旧版本。'
+    dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '数据库备份失败，已重新启动旧版本。'
   fi
-  if ! tar -czf "$backup/files.tar.gz" -C "$ROOT" data subscribes rule_templates; then
-    dc start mmwx caddy; rm -f "$ROOT/update.json"; die '文件备份失败，已重新启动旧版本。'
+  if ! tar -czf "$backup/files.tar.gz" -C "$ROOT/data" app subscribes rule_templates; then
+    dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '文件备份失败，已重新启动旧版本。'
   fi
   write_update_progress deploying "$backup"
-  render_compose > "$ROOT/compose.yaml.tmp"
-  mv "$ROOT/compose.yaml.tmp" "$ROOT/compose.yaml"
+  render_compose > "$ROOT/config/compose.yaml.tmp"
+  mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
   if dc up -d --wait --wait-timeout 300; then
     save_state
-    rm -f "$ROOT/update.json"
+    rm -f "$ROOT/state/update.json"
     sync_cf; info "更新完成：$VERSION。备份：$backup"
   else
     recover_update
@@ -770,22 +847,32 @@ self_update() {
 }
 finish_image_rollback() {
   load_state
-  VERSION=$(jq -er .version "$ROOT/image-rollback.json")
-  APP_IMAGE=$(jq -er .app "$ROOT/image-rollback.json")
-  CHANNEL=$(jq -er .channel "$ROOT/image-rollback.json")
+  VERSION=$(jq -er .version "$ROOT/state/image-rollback.json")
+  APP_IMAGE=$(jq -er .app "$ROOT/state/image-rollback.json")
+  CHANNEL=$(jq -er .channel "$ROOT/state/image-rollback.json")
   docker pull "$APP_IMAGE"
-  render_compose > "$ROOT/compose.yaml.tmp"
-  mv "$ROOT/compose.yaml.tmp" "$ROOT/compose.yaml"
+  render_compose > "$ROOT/config/compose.yaml.tmp"
+  mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
   # Only recreate the controller. PostgreSQL, Caddy and all persisted data stay in place.
-  dc up -d --no-deps --wait --wait-timeout 300 mmwx
+  if ! dc up -d --no-deps --wait --wait-timeout 300 mmwx; then
+    # state.json still points to the pre-rollback controller; leave data untouched.
+    CHANNEL=''
+    load_state
+    render_compose > "$ROOT/config/compose.yaml.tmp"
+    mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
+    dc up -d --no-deps --wait --wait-timeout 300 mmwx || die '原主控也未能启动，请检查日志后重试恢复。'
+    rm -f "$ROOT/state/image-rollback.json"
+    die '回退版本未通过健康检查，已切回原主控，未还原数据。'
+  fi
   save_state
-  rm -f "$ROOT/image-rollback.json"
+  rm -f "$ROOT/state/image-rollback.json"
   info "主控已切换至 $VERSION，数据库和文件未还原。"
 }
 rollback_stack() {
+  ensure_layout
   preflight; load_state
-  [[ ! -f $ROOT/update.json ]] || die '请先恢复未完成的更新。'
-  if [[ -f $ROOT/image-rollback.json ]]; then finish_image_rollback; return; fi
+  [[ ! -f $ROOT/state/update.json ]] || die '请先恢复未完成的更新。'
+  if [[ -f $ROOT/state/image-rollback.json ]]; then finish_image_rollback; return; fi
   local snapshot version number index=0
   local -a choices=()
   while IFS= read -r snapshot; do
@@ -801,17 +888,20 @@ rollback_stack() {
   [[ $number =~ ^[1-5]$ && $number -le $index ]] || die '无效编号。'
   snapshot=${choices[$((number-1))]}
   confirm '只回退主控版本，保留当前数据；旧版本可能不兼容当前数据库。继续？' || return 0
-  jq '{version,app,channel}' "$snapshot" > "$ROOT/image-rollback.json.tmp"
-  mv "$ROOT/image-rollback.json.tmp" "$ROOT/image-rollback.json"
+  jq '{version,app,channel}' "$snapshot" > "$ROOT/state/image-rollback.json.tmp"
+  mv "$ROOT/state/image-rollback.json.tmp" "$ROOT/state/image-rollback.json"
   finish_image_rollback
 }
 remove_services() {
-  if [[ -f $ROOT/compose.yaml ]]; then dc down; fi
+  if [[ -f $ROOT/config/compose.yaml ]]; then dc down; fi
   systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
-  if [[ -f $ROOT/network-backup/state && $(cat "$ROOT/network-backup/state") == pending ]]; then
-    /bin/bash "$ROOT/network-backup/rollback.sh"
+  if [[ -f $ROOT/state/network-backup/state && $(cat "$ROOT/state/network-backup/state") == pending ]]; then
+    /bin/bash "$ROOT/state/network-backup/rollback.sh"
   fi
-  systemctl disable --now mmwx-cf-sync.timer mmwx-firewall.service
+  local unit
+  for unit in mmwx-cf-sync.timer mmwx-firewall.service; do
+    if [[ $(systemctl show --property=LoadState --value "$unit") != not-found ]]; then systemctl disable --now "$unit"; fi
+  done
   rm -f /etc/systemd/system/docker.service.d/mmwx-firewall.conf
   while iptables -C DOCKER-USER -o br-mmwx-front -j MMWX-CF 2>/dev/null; do iptables -D DOCKER-USER -o br-mmwx-front -j MMWX-CF; done
   if iptables -nL MMWX-CF >/dev/null 2>&1; then iptables -F MMWX-CF; iptables -X MMWX-CF; fi
@@ -832,8 +922,9 @@ purge_installation() {
 }
 uninstall_stack() {
   [[ -d $ROOT ]] || die '未发现安装目录。'
-  [[ ! -f $ROOT/update.json ]] || die '请先恢复未完成的更新。'
-  [[ ! -f $ROOT/image-rollback.json ]] || die '请先继续未完成的版本回退。'
+  ensure_layout
+  [[ ! -f $ROOT/state/update.json ]] || die '请先恢复未完成的更新。'
+  [[ ! -f $ROOT/state/image-rollback.json ]] || die '请先继续未完成的版本回退。'
   local mode
   printf '1. 卸载并保留数据（默认）\n2. 完全卸载（删除数据、备份和 Token）\n'
   mode=$(ask '选择 [1]：')
@@ -863,19 +954,20 @@ usage() {
 EOF
 }
 resume_task() {
+  ensure_layout
   install_command
-  if [[ -f $ROOT/update.json ]]; then
+  if [[ -f $ROOT/state/update.json ]]; then
     preflight; recover_update
-  elif [[ -f $ROOT/image-rollback.json ]]; then
+  elif [[ -f $ROOT/state/image-rollback.json ]]; then
     preflight; finish_image_rollback
-  elif [[ -f $ROOT/progress.json ]] && [[ $(jq -r .stage "$ROOT/progress.json") -lt 7 ]]; then
+  elif [[ -f $ROOT/state/progress.json ]] && [[ $(jq -r .stage "$ROOT/state/progress.json") -lt 7 ]]; then
     install_stack
   else
-    [[ -f $ROOT/state.json ]] || die '没有可恢复的任务，请从菜单选择安装。'
+    [[ -f $ROOT/state/state.json ]] || die '没有可恢复的任务，请从菜单选择安装。'
     preflight; load_state; install_units; network_is_ready || die '请检查 UFW/IPv6 配置后恢复。'
     configure_timezone
-    render_compose > "$ROOT/compose.yaml.tmp"
-    mv "$ROOT/compose.yaml.tmp" "$ROOT/compose.yaml"
+    render_compose > "$ROOT/config/compose.yaml.tmp"
+    mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
     dc config --quiet
     sync_cf; dc up -d --wait --wait-timeout 300; verify_https
     info "已恢复：https://$DOMAIN"
@@ -919,7 +1011,7 @@ main() {
   [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
   if [[ -z $ACTION ]]; then menu; return; fi
   case "$ACTION" in install|update|uninstall|resume|self-update|rollback) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
-  if [[ $ACTION == install && ! -f $ROOT/progress.json ]]; then
+  if [[ $ACTION == install && ! -f $ROOT/state/progress.json ]]; then
     printf '\033[1;31m仅限全新环境：启用 UFW、禁用 IPv6；请用 IPv4 SSH。\033[0m\n'
     if [[ $ACCEPT == 0 ]]; then confirm '开始安装？' || return 0; fi
   fi

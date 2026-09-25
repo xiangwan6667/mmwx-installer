@@ -44,12 +44,14 @@ printf '0\n' > "$tmp/answers"
 menu > "$tmp/menu"
 grep -q '继续任务 / 恢复服务' "$tmp/menu"
 DOMAIN=panel.example.com APP_IMAGE=example/app@sha256:abc CADDY_IMAGE=example/caddy@sha256:def PG_IMAGE=postgres:18-alpine
+ROOT=$tmp
+mkdir -p "$ROOT/config"
 render_compose > "$tmp/compose.yaml"
 render_caddy > "$tmp/Caddyfile"
 if command -v docker >/dev/null; then
-  printf 'CF_API_TOKEN=test-only\n' > "$tmp/caddy.env"
-  printf 'MMWX_DATABASE_PASSWORD=test-only\n' > "$tmp/app.env"
-  printf 'POSTGRES_PASSWORD=test-only\n' > "$tmp/postgres.env"
+  printf 'CF_API_TOKEN=test-only\n' > "$ROOT/config/caddy.env"
+  printf 'MMWX_DATABASE_PASSWORD=test-only\n' > "$ROOT/config/app.env"
+  printf 'POSTGRES_PASSWORD=test-only\n' > "$ROOT/config/postgres.env"
   docker compose -f "$tmp/compose.yaml" config --format json > "$tmp/config.json"
   jq -e '.services.mmwx.ports == null and .services.postgres.ports == null and (.services.caddy.ports | length == 2) and .networks.database.internal == true' "$tmp/config.json" >/dev/null
 fi
