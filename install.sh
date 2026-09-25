@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.3
+SCRIPT_VERSION=0.2.4
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -905,6 +905,7 @@ prepare_secrets() {
 }
 install_stack() {
   ensure_layout
+  [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight
   [[ ! -f $ROOT/state/update.json ]] || die '有未完成的更新，请选择「继续任务 / 恢复服务」。'
   if [[ -f $ROOT/state/progress.json ]]; then
@@ -1012,6 +1013,7 @@ recover_update() {
 }
 update_stack() {
   ensure_layout
+  [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight
   install_command
   if [[ -f $ROOT/state/update.json ]]; then recover_update; return; fi
@@ -1047,6 +1049,39 @@ update_stack() {
     recover_update
     die '新版本健康检查失败，已恢复旧版本和数据库。'
   fi
+}
+reinstall_stack() {
+  [[ ! -f $ROOT/state.json && ! -f $ROOT/progress.json && ! -d $ROOT/.layout-migration ]] || die '旧版目录需先通过菜单 5 完成迁移，再重装主控。'
+  ensure_layout
+  preflight
+  [[ ! -f $ROOT/state/update.json && ! -f $ROOT/state/image-rollback.json ]] || die '请先通过菜单 5 完成更新或版本回退。'
+  [[ ! -f $ROOT/state/progress.json ]] || [[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]] || die '请先完成安装，再重装镜像。'
+  CHANNEL=''
+  load_state
+  if [[ ! -f $ROOT/state/reinstall.json ]]; then
+    confirm "重新拉取并重建妙妙屋 $VERSION？全部数据保留，主控会短暂中断，数据库和网关保持运行。" || return 0
+    cp "$ROOT/state/state.json" "$ROOT/state/reinstall.json.tmp"
+    mv "$ROOT/state/reinstall.json.tmp" "$ROOT/state/reinstall.json"
+  fi
+  finish_reinstall
+}
+finish_reinstall() {
+  local name
+  [[ ! -f $ROOT/state/update.json && ! -f $ROOT/state/image-rollback.json ]] || die '存在冲突任务，请先检查任务状态。'
+  cmp -s "$ROOT/state/state.json" "$ROOT/state/reinstall.json" || die '安装记录已变化，停止镜像重装。'
+  CHANNEL=''
+  load_state
+  for name in compose.yaml Caddyfile postgres.env app.env caddy.env cloudflare.token; do
+    [[ -f $ROOT/config/$name ]] || die "缺少配置 $name，停止重装以保留现有数据。"
+  done
+  network_is_ready || die '请检查 UFW/IPv6 配置后继续重装。'
+  dc config --format json | jq -e --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" \
+    '.services.mmwx.image==$app and .services.caddy.image==$caddy and .services.postgres.image==$pg' >/dev/null || die '容器配置与安装记录不一致，停止重装。'
+  run_step "重新拉取主控 $VERSION" docker pull "$APP_IMAGE" || die '主控镜像下载失败，可通过菜单 5 继续。'
+  run_step '重新创建妙妙屋容器' dc up -d --no-deps --force-recreate --wait --wait-timeout 300 mmwx || die '主控重建未完成，可通过菜单 5 继续。'
+  verify_https || die 'HTTPS 验证未通过，可通过菜单 5 继续。'
+  rm -f "$ROOT/state/reinstall.json"
+  info "妙妙屋重装完成：$VERSION。数据、配置、证书和凭据均保留。"
 }
 self_update() {
   local downloaded staged
@@ -1100,6 +1135,7 @@ finish_image_rollback() {
 }
 rollback_stack() {
   ensure_layout
+  [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight; load_state
   [[ ! -f $ROOT/state/update.json ]] || die '请先恢复未完成的更新。'
   if [[ -f $ROOT/state/image-rollback.json ]]; then finish_image_rollback; return; fi
@@ -1150,6 +1186,7 @@ purge_installation() {
 uninstall_stack() {
   [[ -d $ROOT ]] || die '未发现安装目录。'
   ensure_layout
+  [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   [[ ! -f $ROOT/state/update.json ]] || die '请先恢复未完成的更新。'
   [[ ! -f $ROOT/state/image-rollback.json ]] || die '请先继续未完成的版本回退。'
   local mode
@@ -1179,7 +1216,7 @@ uninstall_script() {
 }
 usage() {
   cat <<'EOF'
-用法：mmwx（管理菜单）或 sudo bash install.sh [install|update|rollback|uninstall|status|logs|resume|check|self-update|uninstall-script]
+用法：mmwx（管理菜单）或 sudo bash install.sh [install|update|reinstall|rollback|uninstall|status|logs|resume|check|self-update|uninstall-script]
   --prefix mmwx              子域名前缀（交互输入回车默认 mmwx）
   --zone example.com         Token 授权多个主域名时指定主域名
   --domain panel.example.com  兼容完整域名参数
@@ -1187,12 +1224,15 @@ usage() {
   --cf-token-file /root/token root 所有、600 权限的 Token 文件
   --yes                      接受全新环境提示；必须五分钟内另开 SSH 执行 confirm-network
 安装需确认新 SSH 连接；check 只检查环境，不修改系统。
+reinstall 重新拉取当前版本镜像，仅重建妙妙屋容器，保留全部数据和配置。
 EOF
 }
 resume_task() {
   ensure_layout
   install_command
-  if [[ -f $ROOT/state/update.json ]]; then
+  if [[ -f $ROOT/state/reinstall.json ]]; then
+    preflight; finish_reinstall
+  elif [[ -f $ROOT/state/update.json ]]; then
     preflight; recover_update
   elif [[ -f $ROOT/state/image-rollback.json ]]; then
     preflight; finish_image_rollback
@@ -1216,7 +1256,8 @@ menu_header() {
     version=$(jq -r '.version // "未知"' "$state" 2>/dev/null) || version='未知'
     domain=$(jq -r '.domain // ""' "$state" 2>/dev/null) || domain=''
   fi
-  if [[ -f $ROOT/state/image-rollback.json ]]; then task='版本切换待继续';
+  if [[ -f $ROOT/state/reinstall.json ]]; then task='镜像重装待继续';
+  elif [[ -f $ROOT/state/image-rollback.json ]]; then task='版本切换待继续';
   elif [[ -f $ROOT/state/update.json ]]; then task='更新恢复待继续';
   elif command -v jq >/dev/null && [[ -f $ROOT/state/progress.json ]] && [[ $(jq -r .stage "$ROOT/state/progress.json") != 7 ]]; then task='安装待继续'; fi
   section "妙妙屋 X  ·  管理脚本 v$SCRIPT_VERSION"
@@ -1235,12 +1276,12 @@ menu() {
   [[ -z $CHANNEL ]] || arguments+=(--channel "$CHANNEL")
   while true; do
     menu_header
-    printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n\n  管理\n    7  更新管理脚本\n    8  卸载服务\n    9  卸载管理脚本\n\n    0  退出\n\n'
+    printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n    7  强制重新安装\n\n  管理\n    8  更新管理脚本\n    9  卸载服务\n   10  卸载管理脚本\n\n    0  退出\n\n'
     choice=$(ask '选择：')
     case "$choice" in
       1) action=install;; 2) action=update;; 3) action=status;; 4) action=logs;;
       5) action=resume;; 6) action=rollback;;
-      7) action=self-update;; 8) action=uninstall;; 9) action=uninstall-script;;
+      7) action=reinstall;; 8) action=self-update;; 9) action=uninstall;; 10) action=uninstall-script;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
     esac
     if /bin/bash "$SELF" "$action" "${arguments[@]}"; then
@@ -1258,7 +1299,7 @@ main() {
   fi
   while (($#)); do
     case "$1" in
-      install|update|uninstall|status|logs|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network) ACTION=$1; shift;;
+      install|update|reinstall|uninstall|status|logs|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network) ACTION=$1; shift;;
       --yes) ACCEPT=1; shift;;
       --domain|--prefix|--zone|--channel|--cf-token-file)
         [[ $# -ge 2 ]] || die "缺少参数：$1"
@@ -1269,7 +1310,7 @@ main() {
   done
   [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
   if [[ -z $ACTION ]]; then open_installed_menu; return; fi
-  case "$ACTION" in install|update|uninstall|resume|self-update|uninstall-script|rollback) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
   if [[ $ACTION == install && ! -f $ROOT/state/progress.json ]]; then
     printf '\033[1;31m仅限全新环境：启用 UFW、禁用 IPv6；请用 IPv4 SSH。\033[0m\n'
     if [[ $ACCEPT == 0 ]]; then confirm '开始安装？' || return 0; fi
@@ -1278,6 +1319,7 @@ main() {
     firewall-apply) apply_firewall;; firewall-sync) sync_cf;; confirm-network) confirm_network;;
     check) preflight; info '环境预检通过。';;
     install) install_stack;; update) update_stack;; uninstall) uninstall_stack;;
+    reinstall) reinstall_stack;;
     self-update) self_update;; rollback) rollback_stack;;
     uninstall-script) uninstall_script;;
     status) load_state; dc ps; ufw status;; logs) load_state; dc logs --tail 80 caddy mmwx;;
