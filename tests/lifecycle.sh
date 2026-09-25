@@ -14,7 +14,7 @@ printf 'old-compose' > "$ROOT/config/compose.yaml"
 preflight() { :; }
 install_command() { :; }
 configure_timezone() { :; }
-load_state() { :; }
+load_state() { VERSION=v0; APP_IMAGE=app:v0; }
 choose_version() { VERSION=v1; }
 dc() { printf '%s\n' "$*" >> "$ROOT/operations"; }
 tar() { return 1; }

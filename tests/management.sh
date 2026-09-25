@@ -12,6 +12,7 @@ recent=$(recent_releases stable < "$tmp/releases")
 fetch_releases() { cat "$tmp/releases"; }
 ask() { case "$1" in *'编号'*) echo 2;; *'通道'*) echo 1;; *) echo 3;; esac; }
 docker() { if [[ $1 == image ]]; then echo image@sha256:fixture; fi; }
+check_app_image() { return 0; }
 CHANNEL='' ACTION=install
 choose_version >/dev/null
 [[ $VERSION == v21 && $CHANNEL == stable ]]

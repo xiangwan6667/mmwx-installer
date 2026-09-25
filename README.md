@@ -9,7 +9,7 @@
 
 </div>
 
-通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.2**。
+通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.3**。
 
 ## 功能
 
@@ -80,7 +80,9 @@ root 用户直接运行 `mmwx`。
 | 9 | 卸载管理脚本 |
 | 0 | 退出 |
 
-安装和更新可选择最新正式版、最新测试版，或从所选通道最近 **5 个版本**中选择。版本来自上游官方 Releases，GitHub API 不可用时改读发布网页；对应容器镜像尚未发布时会停止。
+安装和更新可选择最新正式版、最新测试版，或从所选通道最近 **5 个版本**中选择。版本来自上游官方 Releases，GitHub API 不可用时改读发布网页。
+
+脚本会先检查镜像是否发布并支持本机架构。最新版镜像未就绪时，在同一通道最近 5 个版本中寻找上一可用版本，经 `y/n` 确认后使用；指定版本不可用时，可重试或重选。网络、限流和鉴权错误会停止操作。更新前完成镜像检查和下载，选择的镜像与当前运行版本相同时无需重启服务。
 
 更新管理脚本使用菜单 **7**；旧版没有此入口时，重新执行上方安装命令即可。脚本版本可用 `mmwx --version` 查看，命令参数见 `mmwx --help`。
 

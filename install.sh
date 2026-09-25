@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.2
+SCRIPT_VERSION=0.2.3
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -385,7 +385,7 @@ select_version_menu() {
   printf '  1  正式版
   2  测试版（Beta）
 '
-  number=$(ask '选择通道 [1]：')
+  number=$(ask '选择通道 [1]：') || die '无法读取通道选择。'
   case "$number" in ''|1) CHANNEL=stable;; 2) CHANNEL=beta;; *) die '无效通道。';; esac
   recent=$(recent_releases "$CHANNEL" <<<"$pages")
   count=$(jq length <<<"$recent")
@@ -394,16 +394,80 @@ select_version_menu() {
   最近 %s 个%s
 ' "$count" "$(channel_name "$CHANNEL")"
   jq -r 'to_entries[] | "  \(.key+1)  \(.value.tag_name)    \(.value.published_at[:10])"' <<<"$recent"
-  number=$(ask '版本编号：')
+  number=$(ask '版本编号：') || die '无法读取版本选择。'
   [[ $number =~ ^[1-5]$ && $number -le $count ]] || die '无效编号。'
   selected=$(jq -c --argjson index "$((number-1))" '.[$index]' <<<"$recent")
   VERSION=$(jq -r .tag_name <<<"$selected")
 }
+# 0: published for this host; 10: missing tag/repository; 11: missing platform;
+# 20: check failed (transport, access, rate limit or invalid registry response).
+check_app_image() (
+  set +x
+  local version=${1:-} arch dir logfile status token kind digest
+  local base=https://ghcr.io/v2/iluobei/miaomiaowux
+  local accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+  [[ $version =~ ^v?[0-9][A-Za-z0-9._-]*$ && ${#version} -le 128 ]] || return 20
+  case "$(uname -m)" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; *) return 20;; esac
+  mkdir -p "$ROOT/state/logs" || return 20
+  logfile=$ROOT/state/logs/image-check.log
+  dir=$(mktemp -d) || return 20
+  trap 'rm -rf "$dir"' EXIT
+  printf 'Version %s; platform linux/%s\n' "$version" "$arch" >> "$logfile" || return 20
+  # Keep registry credentials out of process arguments, output and persistent logs.
+  image_check_request() {
+    local phase=$1 url=$2 code
+    shift 2
+    if status=$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -sSL \
+      --connect-timeout 10 --max-time 30 --max-redirs 3 \
+      -o "$dir/body" -w '%{http_code}' "$@" "$url" 2>> "$logfile"); then
+      printf '%s HTTP %s\n' "$phase" "$status" >> "$logfile"
+    else
+      code=$?
+      printf '%s transport error %s (HTTP %s)\n' "$phase" "$code" "$status" >> "$logfile"
+      return 20
+    fi
+  }
+  image_check_error() {
+    printf '%s\n' "$1" >> "$logfile"
+    printf '  镜像检查未完成：%s；日志：%s\n' "$1" "$logfile" >&2
+    return 20
+  }
+  image_check_request token 'https://ghcr.io/token?service=ghcr.io&scope=repository:iluobei/miaomiaowux:pull' || return 20
+  [[ $status == 200 ]] || { image_check_error 'GHCR 授权请求失败'; return 20; }
+  token=$(jq -ers 'select(length==1) | .[0] | (.token // .access_token) | select(type=="string" and test("^[A-Za-z0-9._~+/-]+=*$"))' "$dir/body" 2>/dev/null) || { image_check_error 'GHCR 授权响应异常'; return 20; }
+  printf 'Authorization: Bearer %s\n' "$token" > "$dir/headers" || return 20
+  unset token
+  image_check_request manifest "$base/manifests/${version#v}" -H "@$dir/headers" -H "Accept: $accept" || return 20
+  if [[ $status == 404 ]] && jq -es 'length==1 and (.[0] | (.errors|type=="array" and length>0) and all(.errors[]; .code=="MANIFEST_UNKNOWN" or .code=="NAME_UNKNOWN"))' "$dir/body" >/dev/null 2>&1; then return 10; fi
+  [[ $status == 200 ]] || { image_check_error 'GHCR 镜像查询失败'; return 20; }
+  kind=$(jq -ers 'select(length==1) | .[0] | select(.schemaVersion==2) | .mediaType | select(type=="string")' "$dir/body" 2>/dev/null) || { image_check_error '镜像清单格式异常'; return 20; }
+  case "$kind" in
+    application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json)
+      jq -e '(.manifests|type=="array") and all(.manifests[];
+        (.mediaType=="application/vnd.oci.image.manifest.v1+json" or .mediaType=="application/vnd.docker.distribution.manifest.v2+json") and
+        (.digest|type=="string" and test("^sha256:[a-f0-9]{64}$")) and (.size|type=="number" and .>=0) and
+        (.platform.os|type=="string" and length>0) and (.platform.architecture|type=="string" and length>0))' "$dir/body" >/dev/null 2>&1 || { image_check_error '镜像架构清单异常'; return 20; }
+      if jq -e --arg arch "$arch" 'any(.manifests[]; .platform.os=="linux" and .platform.architecture==$arch)' "$dir/body" >/dev/null; then return 0; fi
+      printf 'No linux/%s image in manifest index\n' "$arch" >> "$logfile"
+      return 11;;
+    application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json)
+      digest=$(jq -er 'select((.layers|type=="array") and
+        (.config.mediaType=="application/vnd.oci.image.config.v1+json" or .config.mediaType=="application/vnd.docker.container.image.v1+json") and
+        (.config.size|type=="number" and .>=0)) | .config.digest | select(type=="string" and test("^sha256:[a-f0-9]{64}$"))' "$dir/body" 2>/dev/null) || { image_check_error '镜像配置描述异常'; return 20; }
+      image_check_request config "$base/blobs/$digest" -H "@$dir/headers" || return 20
+      [[ $status == 200 ]] || { image_check_error '镜像配置查询失败'; return 20; }
+      jq -es 'length==1 and (.[0] | (.os|type=="string" and length>0) and (.architecture|type=="string" and length>0))' "$dir/body" >/dev/null 2>&1 || { image_check_error '镜像架构配置异常'; return 20; }
+      if jq -e --arg arch "$arch" '.os=="linux" and .architecture==$arch' "$dir/body" >/dev/null; then return 0; fi
+      printf 'Config does not support linux/%s\n' "$arch" >> "$logfile"
+      return 11;;
+    *) image_check_error '镜像清单类型不受支持'; return 20;;
+  esac
+)
 pull_app_version() {
   [[ $VERSION =~ ^v?[0-9][A-Za-z0-9._-]*$ ]] || die '上游版本号格式异常。'
   APP_IMAGE="ghcr.io/iluobei/miaomiaowux:${VERSION#v}"
-  run_step "下载主控 $VERSION" docker pull "$APP_IMAGE" || die "镜像尚未发布或下载失败：$VERSION。"
-  APP_IMAGE=$(docker image inspect "$APP_IMAGE" --format '{{index .RepoDigests 0}}')
+  run_step "下载主控 $VERSION" docker pull "$APP_IMAGE" || die "镜像下载失败：$VERSION，请检查网络或稍后重试。"
+  APP_IMAGE=$(docker image inspect "$APP_IMAGE" --format '{{index .RepoDigests 0}}') || die '读取主控镜像摘要失败，未切换版本。'
 }
 choose_version() {
   local pages selected mode choice=''
@@ -420,7 +484,7 @@ choose_version() {
   2  最新测试版
   3  指定版本
 '
-    choice=$(ask "选择 [回车沿用$(channel_name "${CHANNEL:-stable}")]：")
+    choice=$(ask "选择 [回车沿用$(channel_name "${CHANNEL:-stable}")]：") || die '无法读取版本选择。'
     case "$choice" in
       '') CHANNEL=${CHANNEL:-stable};; 1) CHANNEL=stable;; 2) CHANNEL=beta;;
       3) select_version_menu "$pages";; *) die '无效选择。';;
@@ -431,7 +495,52 @@ choose_version() {
     selected=$(select_release "$CHANNEL" <<<"$pages") || die '所选通道没有可用版本。'
     VERSION=$(jq -r .tag_name <<<"$selected")
   fi
+  if [[ $choice == 3 ]]; then
+    select_available_image "$pages" specified || return 1
+  else
+    select_available_image "$pages" latest || return 1
+  fi
   pull_app_version
+}
+
+image_unavailable_notice() {
+  case "$2" in
+    10) info "$1 镜像尚未发布。";;
+    11) info "$1 暂无适合本机架构的镜像。";;
+    *) die "镜像仓库检查失败，可能是网络、限流或鉴权错误。请稍后重试；日志：$ROOT/state/logs/image-check.log";;
+  esac
+}
+select_available_image() {
+  local pages=$1 mode=$2 status candidate choice
+  while true; do
+    info "检查主控 $VERSION 镜像……"
+    if check_app_image "$VERSION"; then return 0; else status=$?; fi
+    image_unavailable_notice "$VERSION" "$status"
+    if [[ $mode == specified ]]; then
+      printf '\n  1  重试\n  2  重新选择版本\n  0  返回\n\n'
+      choice=$(ask '选择 [0]：') || die '无法读取版本选择。'
+      case "$choice" in
+        1) continue;;
+        2) select_version_menu "$pages"; continue;;
+        ''|0) info '已取消版本选择。'; return 1;;
+        *) die '无效选择。';;
+      esac
+    fi
+    # Latest mode considers only earlier releases in the selected channel.
+    while IFS= read -r candidate; do
+      info "检查主控 $candidate 镜像……"
+      if check_app_image "$candidate"; then
+        if confirm "使用上一可用$(channel_name "$CHANNEL") $candidate？"; then
+          VERSION=$candidate
+          return 0
+        fi
+        info '已取消版本选择。'
+        return 1
+      else status=$?; fi
+      image_unavailable_notice "$candidate" "$status"
+    done < <(recent_releases "$CHANNEL" <<<"$pages" | jq -r '.[1:][].tag_name')
+    die '该通道最近版本均无适合本机的镜像，请稍后重试或指定其他通道。'
+  done
 }
 
 dns_check() {
@@ -828,7 +937,7 @@ install_stack() {
     checkpoint 2
   fi
   install_docker
-  if ((STAGE<3)); then choose_version; checkpoint 3; fi
+  if ((STAGE<3)); then choose_version || return 0; checkpoint 3; fi
   if ((STAGE<4)); then
     build_caddy
     run_step '下载 PostgreSQL 镜像' docker pull "$PG_IMAGE"
@@ -910,8 +1019,12 @@ update_stack() {
   [[ ! -f $ROOT/state/progress.json ]] || [[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]] || die '请先继续完成安装。'
   load_state
   configure_timezone
-  local backup
-  choose_version
+  local backup current_version=$VERSION current_image=$APP_IMAGE
+  choose_version || return 0
+  if [[ $VERSION == "$current_version" && $APP_IMAGE == "$current_image" ]]; then
+    info "当前已运行 $VERSION，无需更新。"
+    return 0
+  fi
   mkdir -p "$ROOT/backups"
   backup=$(mktemp -d "$ROOT/backups/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
   cp "$ROOT/config/compose.yaml" "$ROOT/state/state.json" "$backup/"
@@ -993,6 +1106,7 @@ rollback_stack() {
   local pages current=$VERSION
   pages=$(fetch_releases 5) || die '无法读取官方版本，请检查 GitHub 网络后重试。'
   select_version_menu "$pages"
+  select_available_image "$pages" specified || return 0
   [[ $VERSION != "$current" ]] || { info '选择的是当前版本，无需切换。'; return; }
   confirm "主控 $current → $VERSION，保留当前数据。继续？" || return 0
   pull_app_version
