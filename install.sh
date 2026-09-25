@@ -1389,16 +1389,17 @@ for binary in ('iptables', 'ip6tables'):
 PY
 }
 docker_purge_preflight() {
-  local journal=$ROOT/state/docker-purge.json details id label network name bridge phase
-  local -a bridges=()
+  local journal=$ROOT/state/docker-purge.json details id label network name bridge phase users owner
+  local -a bridges=() volumes=()
   [[ ! -L $ROOT && ! -L $ROOT/state && ! -L $journal ]] || die 'Docker 卸载记录路径异常。'
   if [[ -f $journal ]]; then
     jq -e '(.phase == "prepared" or .phase == "stopping" or .phase == "removed") and (.bridges | type == "array") and all(.bridges[]; type == "string" and test("^[a-zA-Z0-9_.-]{1,15}$") and . != "lo")' "$journal" >/dev/null || die 'Docker 卸载记录无效。'
     phase=$(jq -r .phase "$journal")
+    mapfile -t bridges < <(jq -r '.bridges[]' "$journal")
     if [[ $phase == stopping || $phase == removed ]]; then
       if systemctl is-active --quiet docker.service || systemctl is-active --quiet containerd.service; then
         # Recheck workloads if services were started again after interruption.
-        mapfile -t bridges < <(jq -r '.bridges[]' "$journal")
+        :
       else
         docker_purge_paths_check; return
       fi
@@ -1431,7 +1432,23 @@ PY
     while IFS= read -r id; do
       [[ -n $id ]] || continue
       label=$(docker volume inspect "$id" --format '{{index .Labels "com.docker.compose.project"}}') || return 1
-      [[ $label == mmwx-installer ]] || die "发现其他项目存储卷 $id，停止完全卸载。"
+      if [[ $label != mmwx-installer ]]; then
+        # Anonymous image volumes have no Compose label. Require every attached
+        # container to belong to this project; detached unknown volumes stay safe.
+        [[ -z $label || $label == '<no value>' ]] || die "发现其他项目存储卷 $id，停止完全卸载。"
+        users=$(docker ps -aq --filter "volume=$id") || return 1
+        if [[ -z $users ]]; then
+          if [[ ! -f $journal ]] || ! jq -e --arg id "$id" '(.volumes // []) | index($id) != null' "$journal" >/dev/null; then
+            die "发现其他项目存储卷 $id，停止完全卸载。"
+          fi
+        fi
+        while IFS= read -r owner; do
+          [[ -n $owner ]] || continue
+          label=$(docker inspect "$owner" --format '{{index .Config.Labels "com.docker.compose.project"}}') || return 1
+          [[ $label == mmwx-installer ]] || die "存储卷 $id 被其他项目使用，停止完全卸载。"
+        done <<< "$users"
+      fi
+      volumes+=("$id")
     done <<< "$details"
     details=$(docker network ls -q) || return 1
     while IFS= read -r id; do
@@ -1467,7 +1484,8 @@ PY
     [[ ! -L $name && $(readlink -m "$name") == "$name" ]] || die "Docker 目录异常：$name。"
   done
   mkdir -p "$ROOT/state" || return 1
-  jq -n --args '{phase:"prepared",bridges:$ARGS.positional}' "${bridges[@]}" > "$journal.tmp" || return 1
+  details=$(printf '%s\n' "${volumes[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
+  jq -n --argjson volumes "$details" --args '{phase:"prepared",bridges:($ARGS.positional | unique),volumes:$volumes}' "${bridges[@]}" > "$journal.tmp" || return 1
   mv "$journal.tmp" "$journal" || return 1
 }
 docker_purge_phase() {

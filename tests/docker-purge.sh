@@ -3,13 +3,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source ./install.sh
 case $(uname -s) in MINGW*|MSYS*) jq() { command jq -b "$@"; };; esac
-scratch=$(mktemp -d); trap 'rm -rf "$scratch"' EXIT
+scratch=$(mktemp -d)
+trap 'if [[ $? != 0 && -f $scratch/output ]]; then cat "$scratch/output" >&2; fi; rm -rf "$scratch"' EXIT
 host=$(cd "$scratch" && pwd -P)/host
 ROOT=$host/opt/mmwx-installer
 mkdir -p "$ROOT/state" "$host/var/lib/docker" "$host/var/lib/containerd" "$host/etc/docker"
 for operation in docker_purge_paths_check docker_purge_phase docker_purge_preflight purge_docker; do
   eval "$(declare -f "$operation" | sed "s|/var/lib/docker|$host/var/lib/docker|g; s|/var/lib/containerd|$host/var/lib/containerd|g; s|/etc/docker|$host/etc/docker|g; s|/etc/containerd|$host/etc/containerd|g; s|/etc/apt/|$host/etc/apt/|g")"
 done
+# Avoid falling through to the CI runner's real Docker binary after mock purge.
+# shellcheck disable=SC2016
+eval "$(declare -f purge_docker | sed 's/command -v docker/test "${DOCKER_REMOVED:-0}" = 0/g')"
 # External services are mocked; paths, JSON journal and deletion are real.
 # shellcheck disable=SC2317,SC2329
 docker_fixture() {
@@ -20,6 +24,9 @@ docker_fixture() {
     'inspect foreign --format '*) echo other;;
     'volume ls -q') printf '%s' "${VOLUMES:-}";;
     'volume inspect foreign --format '*) echo other;;
+    'volume inspect anonymous --format '*) echo '<no value>';;
+    'ps -aq --filter volume=anonymous') echo project;;
+    'inspect project --format '*) echo mmwx-installer;;
     'network ls -q') printf '%s' "${NETWORKS:-bridge}";;
     'network inspect foreign') echo '[{"Name":"foreign","Labels":{}}]';;
     'network inspect bridge') echo '[{"Name":"bridge","Id":"123456789abc1234","Driver":"bridge","Options":{"com.docker.network.bridge.name":"docker0"},"Labels":{}}]';;
@@ -43,7 +50,7 @@ apt-get() {
   printf '%s\n' "$*" >> "$scratch/apt"
   if [[ $1 == -s ]]; then echo 'Purg docker-ce [1.0]'; return; fi
   [[ ${APT_FAIL:-0} != 1 ]] || return 1
-  unset -f docker
+  export DOCKER_REMOVED=1
 }
 env() { shift; "$@"; }
 ip() { printf '%s\n' "$*" >> "$scratch/ip"; }
@@ -61,8 +68,8 @@ SERVICE_ACTIVE=1 expect_refusal containerd 'containerd 中存在其他项目'
 printf stored > "$host/var/lib/containerd/foreign"
 expect_refusal stopped-containerd 'containerd 已停止'
 rm "$host/var/lib/containerd/foreign"
-# Success proves the rejection cases above do not merely fail on broken mocks.
-docker_purge_preflight
+# Success also accepts anonymous volumes attached only to project containers.
+VOLUMES=anonymous docker_purge_preflight
 jq -e '.phase=="prepared" and .bridges==["docker0"]' "$ROOT/state/docker-purge.json" >/dev/null
 printf image-layer > "$host/var/lib/docker/image"
 printf cached-data > "$host/var/lib/containerd/cache"

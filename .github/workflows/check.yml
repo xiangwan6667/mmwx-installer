@@ -26,4 +26,10 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y ufw ipset jq
       - run: sudo bash tests/persistence.sh
       - run: sudo bash tests/caddy-runtime.sh
+  purge-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y ufw ipset jq
       - run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT bash tests/firewall-live.sh
