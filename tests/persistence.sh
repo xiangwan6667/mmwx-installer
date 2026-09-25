@@ -25,6 +25,8 @@ printf 'MMWX_DATABASE_PASSWORD=test-ci-only\n' > "$ROOT/config/app.env"
 printf 'CF_API_TOKEN=test-ci-only-cloudflare-token\n' > "$ROOT/config/caddy.env"
 printf 'test-ci-only-cloudflare-token\n' > "$ROOT/config/cloudflare.token"
 printf ':80 {}\n' > "$ROOT/config/Caddyfile"
+# The production renderer is sourced above; a fixture override is defined later.
+# shellcheck disable=SC2218
 render_compose > "$ROOT/original.yaml"
 # Use lightweight stand-ins to verify the exact rendered volumes and time settings.
 docker compose -f "$ROOT/original.yaml" config --format json | jq '
