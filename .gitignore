@@ -1,0 +1,5 @@
+*.env
+*.token
+*.log
+.work/
+/PLAN.md
