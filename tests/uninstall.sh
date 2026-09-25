@@ -1,38 +1,85 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")/.."
 source ./install.sh
-# shellcheck disable=SC2016
-eval "$(declare -f remove_services | sed '1s/remove_services/real_remove_services/; s|/run/mmwx-cf.lock|$ROOT/test-cf.lock|g')"
+source_path=$PWD/install.sh
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-ROOT=$tmp
-mkdir -p "$ROOT/config" "$ROOT/state"
-printf '{}' > "$ROOT/state/state.json"
-printf 'data-to-keep' > "$ROOT/sentinel"
-load_state() { :; }
+tmp=$(cd "$tmp" && pwd -P)
+host=$tmp/host
+ROOT=$host/opt/mmwx-installer
+
+# Exercise the actual deletion paths, with every host path confined to this fixture.
+for operation in remove_services purge_installation uninstall_script; do
+  # shellcheck disable=SC2016
+  eval "$(declare -f "$operation" | sed 's|/opt/mmwx-installer|$host/opt/mmwx-installer|g; s|/usr/local/|$host/usr/local/|g; s|/etc/systemd/|$host/etc/systemd/|g; s|/run/mmwx-cf.lock|$host/cf.lock|g')"
+done
+# Preserve the downloaded-script signature check while redirecting its fixed path.
+# shellcheck disable=SC2016
+eval "$(declare -f cleanup_downloads | sed 's|/root/mmwx-install.sh|$host/root/mmwx-install.sh|g')"
+cd "$tmp"
 ask() { printf '%s' "$CHOICE"; }
-confirm() { printf '%s\n' "$1" >> "$ROOT/prompts"; [[ $ANSWER == y ]]; }
-remove_services() { echo removed >> "$ROOT/calls"; }
-purge_installation() { echo purged >> "$ROOT/calls"; }
-CHOICE='' ANSWER=y
-uninstall_stack >/dev/null
-[[ $(cat "$ROOT/calls") == removed && $(cat "$ROOT/sentinel") == data-to-keep ]]
-: > "$ROOT/calls"
-CHOICE=2 ANSWER=n
-uninstall_stack >/dev/null
-[[ ! -s $ROOT/calls ]]
-CHOICE=2 ANSWER=y
-uninstall_stack >/dev/null
-[[ $(cat "$ROOT/calls") == $'removed\npurged' ]]
-grep -q '永久删除' "$ROOT/prompts"
+confirm() { printf '%s\n' "$1" >> "$tmp/prompts"; [[ $ANSWER == y ]]; }
+dc() { [[ $* == down ]] || return 1; printf 'removed\n' >> "$tmp/calls"; }
 systemctl() { case "$1" in show) echo not-found;; disable) return 42;; *) :;; esac; }
 flock() { :; }
 iptables() { return 1; }
 ipset() { return 1; }
 remove_legacy_cf_rules() { :; }
-# Keep unit-file removal inside this test's filesystem boundary.
-# shellcheck disable=SC2317,SC2329
-rm() { :; }
-real_remove_services
-unset -f rm
-echo 'PASS: uninstall defaults to retention; full deletion requires confirmation'
+docker() { [[ $* == 'image rm mmwx-installer-caddy:2.11.4-cf0.2.4' ]]; }
+# Match the supported root execution while keeping all filesystem operations real.
+stat() { printf '0\n'; }
+
+prepare_installation() {
+  mkdir -p "$ROOT/config" "$ROOT/state" "$host/usr/local/bin" "$host/usr/local/sbin" \
+    "$host/usr/local/lib/mmwx-installer" "$host/etc/systemd/system/docker.service.d" "$host/root"
+  printf '{}' > "$ROOT/state/state.json"
+  printf 'compose' > "$ROOT/config/compose.yaml"
+  printf 'data-to-keep' > "$ROOT/sentinel"
+  cp "$source_path" "$host/usr/local/sbin/mmwx-installer"
+  chmod +x "$host/usr/local/sbin/mmwx-installer"
+  ln -sf "$host/usr/local/sbin/mmwx-installer" "$host/usr/local/bin/mmwx"
+  cp "$source_path" "$host/usr/local/lib/mmwx-installer/runtime.sh"
+  cp "$source_path" "$host/root/mmwx-install.sh"
+  touch "$host/etc/systemd/system/docker.service.d/mmwx-firewall.conf" \
+    "$host/etc/systemd/system/mmwx-firewall.service" \
+    "$host/etc/systemd/system/mmwx-cf-sync.service" "$host/etc/systemd/system/mmwx-cf-sync.timer"
+  SELF=$host/usr/local/sbin/mmwx-installer
+  : > "$tmp/calls"
+}
+assert_manager_retained() {
+  [[ -f $SELF && -x $SELF && -L $host/usr/local/bin/mmwx ]] || {
+    echo 'Service uninstall removed the management command or active menu script'; exit 1;
+  }
+  [[ $(readlink "$host/usr/local/bin/mmwx") == "$SELF" ]]
+  bash "$host/usr/local/bin/mmwx" --version | grep -q '^mmwx-installer '
+}
+
+prepare_installation
+CHOICE='' ANSWER=y
+uninstall_stack > "$tmp/output"
+[[ $(cat "$tmp/calls") == removed && $(cat "$ROOT/sentinel") == data-to-keep ]]
+[[ ! -e $host/etc/systemd/system/mmwx-cf-sync.timer ]]
+assert_manager_retained
+
+: > "$tmp/calls"
+CHOICE=2 ANSWER=n
+uninstall_stack > "$tmp/output"
+[[ ! -s $tmp/calls && -f $ROOT/sentinel ]]
+assert_manager_retained
+
+CHOICE=2 ANSWER=y
+uninstall_stack > "$tmp/output"
+[[ $(cat "$tmp/calls") == removed && ! -e $ROOT ]]
+[[ ! -e $host/usr/local/lib/mmwx-installer/runtime.sh && ! -e $host/root/mmwx-install.sh ]]
+grep -q '永久删除' "$tmp/prompts"
+assert_manager_retained
+
+# The explicit script-only action remains the only way to remove the manager.
+prepare_installation
+rm -f "$host/etc/systemd/system/mmwx-cf-sync.timer" "$host/etc/systemd/system/docker.service.d/mmwx-firewall.conf"
+ANSWER=y
+uninstall_script > "$tmp/output"
+[[ ! -e $host/usr/local/bin/mmwx && ! -e $SELF && ! -e $host/root/mmwx-install.sh ]]
+[[ $(cat "$ROOT/sentinel") == data-to-keep && -f $host/usr/local/lib/mmwx-installer/runtime.sh ]]
+echo 'PASS: service retention and purge keep a working manager; only script uninstall removes it'

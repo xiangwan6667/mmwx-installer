@@ -2,7 +2,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source ./install.sh
-tmp=$(mktemp -d); trap 'docker compose -p mmwx-persistence -f "$tmp/config/compose.yaml" down >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d)
+failed_image="mmwx-persistence-failed:$$"
+cleanup() {
+  docker compose -p mmwx-persistence -f "$tmp/config/compose.yaml" down >/dev/null 2>&1 || true
+  docker image rm "$failed_image" >/dev/null 2>&1 || true
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 ROOT=$tmp
 mkdir -p "$ROOT/config" "$ROOT/state"
 DOMAIN=panel.example.com APP_IMAGE=alpine:3.22 PG_IMAGE=postgres:18-alpine
@@ -83,3 +90,100 @@ sha256sum --check --status "$ROOT/before-reinstall.sha256"
 [[ ! -e $ROOT/state/reinstall.json ]]
 echo 'PASS: database/app/certificate data survives removal and recreation; all three containers use UTC+8'
 echo 'PASS: reinstall recreates only the controller, preserving running dependencies, images, data, credentials and configuration'
+
+# Exercise successful updates and failed-candidate recovery with real Compose,
+# pg_dump/pg_restore and bind mounts. The fixture replaces the application and
+# host/network setup; all service lifecycle operations remain real.
+docker pull alpine:3.21
+updated_image=$(docker image inspect alpine:3.21 --format '{{index .RepoDigests 0}}')
+mkdir -p "$ROOT/failed-image"
+printf 'FROM %s\nCOPY fail.sh /fail.sh\nENTRYPOINT ["sh", "/fail.sh"]\n' "$PG_IMAGE" > "$ROOT/failed-image/Dockerfile"
+cat > "$ROOT/failed-image/fail.sh" <<'EOF'
+#!/bin/sh
+set -eu
+for directory in /app/data /app/subscribes /app/rule_templates; do
+  printf 'failed\n' > "$directory/probe"
+done
+PGPASSWORD=test-ci-only psql -h postgres -U mmwx -d mmwx -v ON_ERROR_STOP=1 -Atc \
+  "UPDATE persistence_test SET value = 'failed' RETURNING value" > /app/data/failed-database-value
+touch /app/data/failed-update-ran
+exit 1
+EOF
+docker build --pull=false -t "$failed_image" "$ROOT/failed-image"
+
+# Pending dependency configuration changes make a missing --no-deps or
+# --no-recreate observable as container replacement, even with pinned images.
+jq '
+  .services.caddy.environment.PERSISTENCE_UPDATE_SENTINEL="pending" |
+  .services.postgres.environment.PERSISTENCE_UPDATE_SENTINEL="pending" |
+  .services.mmwx.depends_on={postgres:{condition:"service_healthy"}} |
+  .services.mmwx.restart="no" |
+  .services.mmwx.command=["sh","-c","touch /tmp/fixture-ready; exec sleep infinity"] |
+  .services.mmwx.healthcheck={test:["CMD","test","-f","/tmp/fixture-ready"],interval:"1s",timeout:"1s",retries:3}
+' "$ROOT/config/compose.yaml" > "$ROOT/update-fixture.json"
+cp "$ROOT/update-fixture.json" "$ROOT/config/compose.yaml"
+render_compose() { jq --arg app "$APP_IMAGE" '.services.mmwx.image=$app' "$ROOT/update-fixture.json"; }
+preflight() { :; }
+install_command() { :; }
+configure_timezone() { :; }
+choose_version() { VERSION=$next_version; APP_IMAGE=$next_image; }
+sync_cf() { die 'Controller update must not synchronize or reload the gateway.'; }
+
+for service in caddy postgres; do
+  container_before[$service]=$(compose ps -q "$service")
+  started_before[$service]=$(docker inspect --format '{{.State.StartedAt}}' "${container_before[$service]}")
+done
+assert_dependencies_unchanged() {
+  local service container_after
+  for service in caddy postgres; do
+    container_after=$(compose ps -q "$service")
+    [[ $container_after == "${container_before[$service]}" ]]
+    [[ $(docker inspect --format '{{.State.StartedAt}}' "$container_after") == "${started_before[$service]}" ]]
+    [[ $(docker inspect --format '{{.State.Running}}' "$container_after") == true ]]
+  done
+}
+backup_for_version() {
+  local directory
+  for directory in "$ROOT/backups/"*; do
+    if [[ $(jq -r .version "$directory/state.json") == "$1" ]]; then
+      printf '%s\n' "$directory"
+      return 0
+    fi
+  done
+  return 1
+}
+
+controller_before=$(compose ps -q mmwx)
+next_version=v1.0.1 next_image=$updated_image
+update_stack
+[[ $(compose ps -q mmwx) != "$controller_before" ]]
+[[ $(docker inspect --format '{{.Image}}' "$(compose ps -q mmwx)") == "$(docker image inspect --format '{{.Id}}' "$updated_image")" ]]
+[[ $(jq -r .version "$ROOT/state/state.json") == v1.0.1 ]]
+[[ $(jq -r .app "$ROOT/state/state.json") == "$updated_image" ]]
+[[ ! -e $ROOT/state/update.json ]]
+assert_dependencies_unchanged
+assert_persisted_data
+success_backup=$(backup_for_version v1.0.0)
+[[ -s $success_backup/database.dump ]]
+[[ $(tar -xOzf "$success_backup/files.tar.gz" app/probe) == retained ]]
+echo 'PASS: successful controller update preserves running gateway/database containers and backs up data'
+
+next_version=v1.0.2 next_image=$failed_image
+set +e
+(set -e; update_stack) > "$ROOT/failed-update.log" 2>&1
+update_status=$?
+set -e
+cat "$ROOT/failed-update.log"
+[[ $update_status -ne 0 ]]
+[[ $(jq -r .version "$ROOT/state/state.json") == v1.0.1 ]]
+[[ $(jq -r .app "$ROOT/state/state.json") == "$updated_image" ]]
+[[ $(docker inspect --format '{{.Image}}' "$(compose ps -q mmwx)") == "$(docker image inspect --format '{{.Id}}' "$updated_image")" ]]
+[[ ! -e $ROOT/state/update.json ]]
+assert_dependencies_unchanged
+assert_persisted_data
+failed_backup=$(backup_for_version v1.0.1)
+[[ -f $failed_backup/failed-app/failed-update-ran ]]
+[[ $(head -n 1 "$failed_backup/failed-app/failed-database-value") == failed ]]
+[[ $(cat "$failed_backup/failed-app/probe") == failed ]]
+[[ ! -e $ROOT/data/app/failed-update-ran ]]
+echo 'PASS: failed controller update restores its previous image, application files and database without restarting dependencies'

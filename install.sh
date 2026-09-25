@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.5
+SCRIPT_VERSION=0.2.6
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -967,7 +967,7 @@ install_stack() {
   printf '\n安装完成：https://%s\n管理菜单：mmwx\n数据库由环境变量管理，无需勾选「使用 PG 数据库」。\n' "$DOMAIN"
 }
 write_update_progress() {
-  jq -n --arg phase "$1" --arg backup "$2" '{phase:$phase,backup:$backup}' > "$ROOT/state/update.json.tmp"
+  jq -n --arg phase "$1" --arg backup "$2" --arg scope "${3:-mmwx}" '{phase:$phase,backup:$backup,service_scope:$scope}' > "$ROOT/state/update.json.tmp"
   mv "$ROOT/state/update.json.tmp" "$ROOT/state/update.json"
 }
 backup_database() { dc exec -T postgres pg_dump -U mmwx -d mmwx -Fc > "$1"; }
@@ -977,18 +977,22 @@ restore_database() {
   dc exec -T postgres pg_restore -U mmwx -d mmwx --exit-on-error < "$1"
 }
 recover_update() {
-  local backup phase directory
+  local backup phase directory scope
   backup=$(jq -er .backup "$ROOT/state/update.json")
   phase=$(jq -er .phase "$ROOT/state/update.json")
+  scope=$(jq -r '.service_scope // "legacy"' "$ROOT/state/update.json")
+  [[ $scope == mmwx || $scope == legacy ]] || die '未知更新服务范围。'
   [[ $backup == "$ROOT/backups/"* && ${backup#"$ROOT/backups/"} != */* && -d $backup ]] || die '更新备份路径异常。'
   [[ -f $backup/compose.yaml && -f $backup/state.json ]] || die '更新恢复文件缺失。'
   case "$phase" in
-    backing-up) ;; # No new version has started; existing data is still authoritative.
+    backing-up)
+      # Existing data is authoritative; legacy migration may have removed PG.
+      if [[ $scope == legacy ]]; then run_step '确认数据库可用' dc up -d --no-deps --no-recreate --wait --wait-timeout 120 postgres; fi;;
     deploying|restoring)
       [[ -s $backup/database.dump && -s $backup/files.tar.gz ]] || die '更新备份不完整，停止恢复。'
-      write_update_progress restoring "$backup"
-      run_step '停止主控和网关' dc stop mmwx caddy
-      run_step '启动数据库' dc up -d --wait --wait-timeout 120 postgres
+      write_update_progress restoring "$backup" "$scope"
+      run_step '停止主控' dc stop mmwx
+      run_step '确认数据库可用' dc up -d --no-deps --no-recreate --wait --wait-timeout 120 postgres
       run_step '恢复数据库备份' restore_database "$backup/database.dump"
       mkdir -p "$backup/restored"
       run_step '解压应用文件备份' tar -xzf "$backup/files.tar.gz" -C "$backup/restored"
@@ -1009,12 +1013,16 @@ recover_update() {
   load_state
   render_compose > "$ROOT/config/compose.yaml.tmp"
   mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
-  run_step '启动服务' dc up -d --wait --wait-timeout 300
+  run_step '启动主控' dc up -d --no-deps --wait --wait-timeout 300 mmwx
+  # Older updates stopped Caddy too; a legacy layout migration may have removed
+  # it. Restore it if needed, without recreating an existing gateway.
+  if [[ $scope == legacy ]]; then run_step '恢复旧任务停止的网关' dc up -d --no-deps --no-recreate --wait --wait-timeout 300 caddy; fi
   rm -f "$ROOT/state/update.json"
   info "已恢复更新前的版本。备份：$backup"
 }
 update_stack() {
   caddy_token_pending_guard
+  [[ ! -f $ROOT/state.json && ! -f $ROOT/progress.json && ! -d $ROOT/.layout-migration ]] || die '旧版目录需先通过菜单 5 完成迁移，再更新主控。'
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight
@@ -1034,20 +1042,20 @@ update_stack() {
   backup=$(mktemp -d "$ROOT/backups/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
   cp "$ROOT/config/compose.yaml" "$ROOT/state/state.json" "$backup/"
   write_update_progress backing-up "$backup"
-  run_step '停止主控和网关' dc stop mmwx caddy
+  run_step '停止主控' dc stop mmwx
   if ! run_step '备份数据库' backup_database "$backup/database.dump"; then
-    run_step '重新启动旧版本' dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '数据库备份失败，已重新启动旧版本。'
+    run_step '重新启动旧版本' dc start mmwx; rm -f "$ROOT/state/update.json"; die '数据库备份失败，已重新启动旧版本。'
   fi
   if ! run_step '备份应用文件' tar -czf "$backup/files.tar.gz" -C "$ROOT/data" app subscribes rule_templates; then
-    run_step '重新启动旧版本' dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '文件备份失败，已重新启动旧版本。'
+    run_step '重新启动旧版本' dc start mmwx; rm -f "$ROOT/state/update.json"; die '文件备份失败，已重新启动旧版本。'
   fi
   write_update_progress deploying "$backup"
   render_compose > "$ROOT/config/compose.yaml.tmp"
   mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
-  if run_step '启动服务' dc up -d --wait --wait-timeout 300; then
+  if run_step '启动主控' dc up -d --no-deps --wait --wait-timeout 300 mmwx; then
     save_state
     rm -f "$ROOT/state/update.json"
-    sync_cf; info "更新完成：$VERSION。备份：$backup"
+    info "更新完成：$VERSION。备份：$backup"
   else
     recover_update
     die '新版本健康检查失败，已恢复旧版本和数据库。'
@@ -1139,6 +1147,7 @@ finish_image_rollback() {
 }
 rollback_stack() {
   caddy_token_pending_guard
+  [[ ! -f $ROOT/state.json && ! -f $ROOT/progress.json && ! -d $ROOT/.layout-migration ]] || die '旧版目录需先通过菜单 5 完成迁移，再回退主控。'
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight; load_state
@@ -1179,8 +1188,6 @@ purge_installation() {
   [[ $ROOT == /opt/mmwx-installer && ! -L $ROOT && $(readlink -f "$ROOT") == /opt/mmwx-installer ]] || die '安装目录异常，停止删除。'
   # A fixed project directory; never follow mounted filesystems during deletion.
   rm -rf --one-file-system -- "$ROOT"
-  if [[ -L /usr/local/bin/mmwx && $(readlink /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]]; then rm -f /usr/local/bin/mmwx; fi
-  rm -f /usr/local/sbin/mmwx-installer
   cleanup_downloads
   rm -f /usr/local/lib/mmwx-installer/runtime.sh
   if [[ -d /usr/local/lib/mmwx-installer ]]; then rmdir /usr/local/lib/mmwx-installer 2>/dev/null || true; fi
@@ -1206,7 +1213,7 @@ uninstall_stack() {
   remove_services
   if [[ $mode == purge ]]; then
     purge_installation
-    info '已完全卸载本项目。Docker、系统网络/时区设置及 Cloudflare DNS 记录保留。'
+    info '服务、数据、备份和 Token 已删除。mmwx 管理命令保留，可从菜单重新安装。Docker、系统网络/时区设置及 Cloudflare DNS 记录保留。'
   else
     info "已卸载容器，数据保留于 $ROOT。运行 mmwx 选择恢复服务。"
   fi

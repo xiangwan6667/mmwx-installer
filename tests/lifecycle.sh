@@ -19,6 +19,8 @@ choose_version() { VERSION=v1; }
 dc() { printf '%s\n' "$*" >> "$ROOT/operations"; }
 tar() { return 1; }
 if (update_stack) >/dev/null 2>&1; then echo 'Failed backup reported success'; exit 1; fi
-grep -qx 'start mmwx caddy' "$ROOT/operations"
+grep -qx 'stop mmwx' "$ROOT/operations"
+grep -qx 'start mmwx' "$ROOT/operations"
+if grep -q caddy "$ROOT/operations"; then echo 'Backup failure disturbed the gateway'; exit 1; fi
 [[ $(cat "$ROOT/config/compose.yaml") == old-compose ]]
 echo 'PASS: expired confirmation rejected; failed backup restarts old application'
