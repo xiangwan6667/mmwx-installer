@@ -2,7 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source ./install.sh
-eval "$(declare -f remove_services | sed '1s/remove_services/real_remove_services/')"
+# shellcheck disable=SC2016
+eval "$(declare -f remove_services | sed '1s/remove_services/real_remove_services/; s|/run/mmwx-cf.lock|$ROOT/test-cf.lock|g')"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 ROOT=$tmp
 mkdir -p "$ROOT/config" "$ROOT/state"
@@ -25,6 +26,7 @@ uninstall_stack >/dev/null
 [[ $(cat "$ROOT/calls") == $'removed\npurged' ]]
 grep -q '永久删除' "$ROOT/prompts"
 systemctl() { case "$1" in show) echo not-found;; disable) return 42;; *) :;; esac; }
+flock() { :; }
 iptables() { return 1; }
 ipset() { return 1; }
 remove_legacy_cf_rules() { :; }

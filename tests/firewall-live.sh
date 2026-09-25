@@ -56,4 +56,11 @@ printf '{"stage":1}' > "$ROOT/progress.json"
 # A stopped/interrupted legacy task must not leave the daily refresh timer stopped.
 ensure_layout
 systemctl is-active --quiet mmwx-cf-sync.timer
+# Removing the manager must retain operational boot and refresh hooks.
+confirm() { return 0; }
+uninstall_script
+[[ ! -e /usr/local/bin/mmwx && ! -e /usr/local/sbin/mmwx-installer ]]
+[[ -x /usr/local/lib/mmwx-installer/runtime.sh ]]
+systemctl restart docker
+assert_access
 echo 'PASS: only permitted sources reach Docker through ipset, including after UFW reload and Docker restart'

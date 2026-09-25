@@ -12,6 +12,7 @@ jobs:
       - run: sudo bash tests/test.sh && sudo bash tests/lifecycle.sh && sudo bash tests/resume.sh && sudo bash tests/update-resume.sh && sudo bash tests/dns.sh
       - run: sudo bash tests/firewall-migration.sh && sudo bash tests/uninstall.sh && sudo bash tests/management.sh
       - run: sudo bash tests/layout.sh
+      - run: sudo bash tests/output-dependencies.sh && sudo bash tests/sync-lock.sh
   runtime:
     runs-on: ubuntu-latest
     timeout-minutes: 10

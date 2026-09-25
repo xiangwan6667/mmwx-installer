@@ -4,12 +4,42 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
+SCRIPT_VERSION=0.2.0
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
-info() { printf '\033[36m%s\033[0m\n' "$*"; }
-die() { printf '\033[31m错误：%s\033[0m\n' "$*" >&2; exit 1; }
+paint() { if [[ -t 1 && -z ${NO_COLOR:-} ]]; then printf '\033[%sm%s\033[0m\n' "$1" "$2"; else printf '%s\n' "$2"; fi; }
+info() { paint 36 "  $*"; }
+die() { paint 31 "  错误：$*" >&2; exit 1; }
+section() { printf '\n'; paint '1;36' "  $*"; printf '  ────────────────────────────────────────\n'; }
+run_step() (
+  local label=$1 logfile pid code=0 elapsed=0
+  shift
+  mkdir -p "$ROOT/state/logs"
+  logfile=$(mktemp "$ROOT/state/logs/step-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")
+  printf '  · %s\n' "$label"
+  # Separate process group covers wrappers (dc) and their external children.
+  set -m
+  "$@" > "$logfile" 2>&1 &
+  pid=$!
+  trap 'kill -TERM -- "-$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; printf "\n  已中断；日志：%s\n" "$logfile"; exit 130' INT TERM
+  if [[ -t 1 ]]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '\r  · %s … %ss' "$label" "$elapsed"
+      sleep 1
+      elapsed=$((elapsed+1))
+    done
+    printf '\r\033[K'
+  fi
+  wait "$pid" 2>/dev/null || code=$?
+  if [[ $code == 0 ]]; then printf '  ✓ %s\n' "$label"; else
+    printf '  ✗ %s\n' "$label" >&2
+    tail -n 12 "$logfile" >&2
+    printf '  完整日志：%s\n' "$logfile" >&2
+  fi
+  return "$code"
+)
 ask() { local value; read -r -p "$1" value </dev/tty || die '无法读取终端，请下载脚本后运行。'; printf '%s' "$value"; }
 is_yes() { [[ $1 == y || $1 == Y ]]; }
 confirm() {
@@ -26,7 +56,11 @@ join_domain() {
   printf '%s.%s\n' "$1" "$2"
 }
 get() { curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 90 --retry 2 "$@"; }
-dc() { docker compose --project-name mmwx-installer --project-directory "$ROOT/config" -f "$ROOT/config/compose.yaml" "$@"; }
+dc() {
+  local config=$ROOT/config
+  if [[ ! -f $config/compose.yaml && -f $ROOT/compose.yaml ]]; then config=$ROOT; fi
+  docker compose --project-name mmwx-installer --project-directory "$config" -f "$config/compose.yaml" "$@"
+}
 ensure_layout() {
   local name pair source target
   if [[ -f $ROOT/state.json || -f $ROOT/progress.json || -d $ROOT/.layout-migration ]]; then
@@ -86,7 +120,7 @@ ensure_layout() {
       configure_timezone
       install_units
       apply_firewall
-      dc up -d --wait --wait-timeout 300
+      run_step '启动服务' dc up -d --wait --wait-timeout 300
     fi
     if [[ -f /etc/systemd/system/mmwx-cf-sync.timer ]]; then systemctl start mmwx-cf-sync.timer; fi
     mv "$ROOT/.layout-migration" "$ROOT/state/layout-v2"
@@ -101,7 +135,7 @@ select_release() {
   jq -ce --arg channel "$1" '[.[] | select(.draft == false and (.prerelease == ($channel == "beta"))) | select(.published_at != null)] | sort_by(.published_at) | last | select(. != null)'
 }
 recent_releases() {
-  jq -ce '[.[] | select(.draft == false and .published_at != null)] | unique_by(.tag_name) | sort_by(.published_at) | reverse | .[:5]'
+  jq -ce --arg channel "$1" '[.[] | select(.draft == false and .published_at != null and (.prerelease == ($channel == "beta")))] | unique_by(.tag_name) | sort_by(.published_at) | reverse | .[:5]'
 }
 parse_release_html() {
   python3 -c 'import sys,re,json,html
@@ -121,7 +155,7 @@ if not rows: sys.exit("Unrecognized GitHub release page")
 print(json.dumps(rows))'
 }
 fetch_releases_web() {
-  local rows='[]' page html parsed
+  local rows='[]' page html parsed count=${1:-1}
   html=$(get "https://github.com/$UPSTREAM/releases/latest") || return 1
   parsed=$(parse_release_html <<<"$html") || return 1
   rows=$parsed
@@ -129,7 +163,7 @@ fetch_releases_web() {
     html=$(get "https://github.com/$UPSTREAM/releases?page=$page") || return 1
     parsed=$(parse_release_html <<<"$html") || return 1
     rows=$(printf '%s\n%s\n' "$rows" "$parsed" | jq -cs 'add | unique_by(.tag_name)')
-    if select_release beta <<<"$rows" >/dev/null; then break; fi
+    if jq -e --argjson count "$count" '([.[]|select(.prerelease==true)]|length)>=$count and ([.[]|select(.prerelease==false)]|length)>=$count' <<<"$rows" >/dev/null; then break; fi
     [[ $html == *'rel="next"'* || $html == *'>Next<'* ]] || break
   done
   printf '%s\n' "$rows"
@@ -139,7 +173,7 @@ fetch_releases() {
   for page in $(seq 1 20); do
     if ! result=$(get "https://api.github.com/repos/$UPSTREAM/releases?per_page=100&page=$page" 2>/dev/null) || ! jq -e 'type == "array"' <<<"$result" >/dev/null 2>&1; then
       printf '版本 API 暂不可用，改用官方发布页面。\n' >&2
-      fetch_releases_web
+      fetch_releases_web "${1:-1}"
       return
     fi
     rows=$(printf '%s\n%s\n' "$rows" "$result" | jq -cs 'add')
@@ -234,10 +268,11 @@ networks:
 EOF
 }
 render_caddy() {
-  local proxies=''
-  if [[ -f $ROOT/state/cloudflare-v4.txt ]]; then
-    validate_cidrs < "$ROOT/state/cloudflare-v4.txt"
-    proxies="trusted_proxies static $(tr '\n' ' ' < "$ROOT/state/cloudflare-v4.txt")"
+  local proxies='' domain=${1:-$DOMAIN} ranges=$ROOT/state/cloudflare-v4.txt
+  [[ -f $ranges ]] || ranges=$ROOT/cloudflare-v4.txt
+  if [[ -f $ranges ]]; then
+    validate_cidrs < "$ranges"
+    proxies="trusted_proxies static $(tr '\n' ' ' < "$ranges")"
   fi
   cat <<EOF
 {
@@ -247,7 +282,7 @@ render_caddy() {
     client_ip_headers CF-Connecting-IP
   }
 }
-$DOMAIN {
+$domain {
   tls {
     dns cloudflare {env.CF_API_TOKEN}
     resolvers 1.1.1.1 1.0.0.1
@@ -288,13 +323,19 @@ preflight() {
   fi
 }
 dependencies() {
-  info '安装基础依赖……'
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl jq python3 ufw ipset openssl >/dev/null
+  local package
+  local -a missing=()
+  for package in ca-certificates curl jq python3 ufw ipset openssl tzdata; do
+    if [[ $(dpkg-query -W -f='${Status}' "$package" 2>/dev/null) != 'install ok installed' ]]; then missing+=("$package"); fi
+  done
+  if ((${#missing[@]}==0)); then info '依赖检查完成，全部已安装。'; return; fi
+  info "补充依赖：${missing[*]}"
+  run_step '刷新软件包索引' apt-get update -qq
+  run_step '安装缺失依赖' env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
 }
 configure_timezone() {
   if [[ ! -f /usr/share/zoneinfo/Asia/Shanghai ]]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tzdata >/dev/null
+    run_step '安装时区数据' env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tzdata
   fi
   timedatectl set-timezone Asia/Shanghai
 }
@@ -306,8 +347,8 @@ install_docker() {
     get "https://download.docker.com/linux/$ID/gpg" -o /etc/apt/keyrings/docker.asc
     chmod 0644 /etc/apt/keyrings/docker.asc
     printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' "$(dpkg --print-architecture)" "$ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/mmwx-docker.list
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
+    run_step '刷新 Docker 软件源' apt-get update -qq
+    run_step '安装 Docker 和 Compose' env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     systemctl enable --now docker
   fi
   docker compose version >/dev/null || die '缺少 Docker Compose 插件。'
@@ -332,49 +373,67 @@ FROM caddy:2.11.4
 COPY caddy /usr/bin/caddy
 EOF
   info '组装 Caddy 容器镜像……'
-  docker build --pull -t mmwx-installer-caddy:2.11.4-cf0.2.4 "$builddir" || { rm -rf "$builddir"; die 'Caddy 构建失败，请检查网络、内存和磁盘。'; }
+  run_step '组装 Caddy 镜像' docker build --pull -t mmwx-installer-caddy:2.11.4-cf0.2.4 "$builddir" || { rm -rf "$builddir"; die 'Caddy 构建失败，请检查网络、内存和磁盘。'; }
   rm -rf "$builddir"
   CADDY_IMAGE=mmwx-installer-caddy:2.11.4-cf0.2.4
   docker run --rm --network none "$CADDY_IMAGE" caddy list-modules | grep -qx dns.providers.cloudflare || die 'Caddy 缺少 Cloudflare 模块。'
 }
-choose_version() {
-  local pages selected mode
-  pages=$(fetch_releases) || die '无法读取官方版本，请检查 GitHub 网络连接后用 mmwx 继续。'
-  info '选择版本：'
-  for mode in stable beta; do
-    selected=$(select_release "$mode" <<<"$pages") || selected=null
-    jq -r --arg mode "$mode" 'if . == null then "\($mode)：暂无" else "\($mode)：\(.tag_name)  \(.published_at)" end' <<<"$selected"
-  done
-  if [[ -z $CHANNEL || ( $ACTION == update && $CHANNEL_EXPLICIT == 0 && $ACCEPT == 0 ) ]]; then
-    local choice
-    choice=$(ask "1=正式版 / 2=Beta / 3=指定版本 [回车沿用 ${CHANNEL:-stable}]：")
-    case "$choice" in
-      '') CHANNEL=${CHANNEL:-stable};; 1) CHANNEL=stable;; 2) CHANNEL=beta;;
-      3)
-        local recent count number
-        recent=$(recent_releases <<<"$pages")
-        count=$(jq length <<<"$recent")
-        [[ $count -gt 0 ]] || die '没有可选版本。'
-        jq -r 'to_entries[] | "\(.key+1). \(.value.tag_name)  \(.value.published_at[:10])"' <<<"$recent"
-        number=$(ask '版本编号：')
-        [[ $number =~ ^[1-5]$ && $number -le $count ]] || die '无效编号。'
-        selected=$(jq -c --argjson index "$((number-1))" '.[$index]' <<<"$recent")
-        CHANNEL=$(jq -r 'if .prerelease then "beta" else "stable" end' <<<"$selected")
-        ;;
-      *) die '无效选择。';;
-    esac
-  else
-    selected=''
-  fi
-  [[ $CHANNEL == stable || $CHANNEL == beta ]] || die 'channel 只能是 stable 或 beta。'
-  if [[ ${choice:-} != 3 ]]; then selected=$(select_release "$CHANNEL" <<<"$pages") || die "没有可用的 $CHANNEL 版本。"; fi
+channel_name() { if [[ $1 == beta ]]; then printf '测试版'; else printf '正式版'; fi; }
+select_version_menu() {
+  local pages=$1 recent number count selected
+  section '指定版本'
+  printf '  1  正式版
+  2  测试版（Beta）
+'
+  number=$(ask '选择通道 [1]：')
+  case "$number" in ''|1) CHANNEL=stable;; 2) CHANNEL=beta;; *) die '无效通道。';; esac
+  recent=$(recent_releases "$CHANNEL" <<<"$pages")
+  count=$(jq length <<<"$recent")
+  [[ $count -gt 0 ]] || die "没有可用的$(channel_name "$CHANNEL")。"
+  printf '
+  最近 %s 个%s
+' "$count" "$(channel_name "$CHANNEL")"
+  jq -r 'to_entries[] | "  \(.key+1)  \(.value.tag_name)    \(.value.published_at[:10])"' <<<"$recent"
+  number=$(ask '版本编号：')
+  [[ $number =~ ^[1-5]$ && $number -le $count ]] || die '无效编号。'
+  selected=$(jq -c --argjson index "$((number-1))" '.[$index]' <<<"$recent")
   VERSION=$(jq -r .tag_name <<<"$selected")
+}
+pull_app_version() {
   [[ $VERSION =~ ^v?[0-9][A-Za-z0-9._-]*$ ]] || die '上游版本号格式异常。'
   APP_IMAGE="ghcr.io/iluobei/miaomiaowux:${VERSION#v}"
-  info "选择 $VERSION；检查对应镜像……"
-  docker pull "$APP_IMAGE" || die "镜像尚未发布或下载失败：$APP_IMAGE。不会改用 latest。"
+  run_step "下载主控 $VERSION" docker pull "$APP_IMAGE" || die "镜像尚未发布或下载失败：$VERSION。"
   APP_IMAGE=$(docker image inspect "$APP_IMAGE" --format '{{index .RepoDigests 0}}')
 }
+choose_version() {
+  local pages selected mode choice=''
+  pages=$(fetch_releases 5) || die '无法读取官方版本，请检查 GitHub 网络连接后用 mmwx 继续。'
+  section '主控版本'
+  for mode in stable beta; do
+    selected=$(select_release "$mode" <<<"$pages") || selected=null
+    printf '  %s  %s
+' "$(channel_name "$mode")" "$(jq -r 'if .==null then "暂无" else .tag_name end' <<<"$selected")"
+  done
+  if [[ -z $CHANNEL || ( $ACTION == update && $CHANNEL_EXPLICIT == 0 && $ACCEPT == 0 ) ]]; then
+    printf '
+  1  最新正式版
+  2  最新测试版
+  3  指定版本
+'
+    choice=$(ask "选择 [回车沿用$(channel_name "${CHANNEL:-stable}")]：")
+    case "$choice" in
+      '') CHANNEL=${CHANNEL:-stable};; 1) CHANNEL=stable;; 2) CHANNEL=beta;;
+      3) select_version_menu "$pages";; *) die '无效选择。';;
+    esac
+  fi
+  [[ $CHANNEL == stable || $CHANNEL == beta ]] || die 'channel 只能是 stable 或 beta。'
+  if [[ $choice != 3 ]]; then
+    selected=$(select_release "$CHANNEL" <<<"$pages") || die '所选通道没有可用版本。'
+    VERSION=$(jq -r .tag_name <<<"$selected")
+  fi
+  pull_app_version
+}
+
 dns_check() {
   [[ -f $TOKEN_FILE && ! -L $TOKEN_FILE ]] || die 'Token 文件不存在或为符号链接。'
   [[ $(stat -c %u "$TOKEN_FILE") == 0 && $(stat -c %a "$TOKEN_FILE") == 600 ]] || die 'Token 文件必须属于 root，权限为 600。'
@@ -433,7 +492,8 @@ token_guide() {
 先将主域名托管到 Cloudflare（注册商修改 NS，等待 Active），SSL 选「完全（严格）」。
 托管：https://dash.cloudflare.com/
 Token：https://dash.cloudflare.com/profile/api-tokens
-权限：Zone / DNS / Edit + Zone / Zone / Read；区域只选你的主域名。
+选择「编辑区域 DNS」模板，补充「区域 → 区域 → 读取」权限。
+区域资源：选择你的主域名。
 脚本自动创建子域名、开启小黄云并申请证书。
 EOF
 }
@@ -444,7 +504,12 @@ fetch_cf() {
   validate_cidrs < "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$target"
 }
-apply_firewall() {
+apply_firewall() (
+  exec 8>/run/mmwx-cf.lock
+  flock -w 180 8 || die '防火墙正在更新，请稍后重试。'
+  apply_firewall_rules
+)
+apply_firewall_rules() {
   local ranges=$ROOT/state/cloudflare-v4.txt cidr
   # An updated manager must still allow Docker to start before legacy layout migration.
   [[ -f $ranges ]] || ranges=$ROOT/cloudflare-v4.txt
@@ -478,22 +543,23 @@ remove_legacy_cf_rules() {
     ufw --force delete "$number" >/dev/null
   done <<<"$numbers"
 }
-sync_cf() {
-  exec 8>/run/mmwx-cf.lock; flock -n 8 || exit 0
-  local old=$ROOT/state/cloudflare-v4.txt new=$ROOT/state/cloudflare-v4.new
+sync_cf() (
+  exec 8>/run/mmwx-cf.lock; flock -w 180 8 || { info 'CF 规则正在更新，请稍后重试。'; return 1; }
+  local state=$ROOT/state config=$ROOT/config
+  if [[ ! -f $state/state.json && -f $ROOT/state.json ]]; then state=$ROOT; config=$ROOT; fi
+  local old=$state/cloudflare-v4.txt new=$state/cloudflare-v4.new
   fetch_cf "$new" || { printf 'Cloudflare IP 更新失败，保留现有规则。\n' >&2; return 1; }
   mv "$new" "$old"
-  apply_firewall
+  apply_firewall_rules
   remove_legacy_cf_rules
-  if [[ -f $ROOT/state/state.json ]]; then
-    DOMAIN=$(jq -er .domain "$ROOT/state/state.json")
-    render_caddy > "$ROOT/config/Caddyfile.next"
+  if [[ -f $state/state.json ]]; then
+    render_caddy "$(jq -er .domain "$state/state.json")" > "$config/Caddyfile.next"
     # Keep the inode: Caddy mounts this individual file.
-    cat "$ROOT/config/Caddyfile.next" > "$ROOT/config/Caddyfile"
-    rm -f "$ROOT/config/Caddyfile.next"
+    cat "$config/Caddyfile.next" > "$config/Caddyfile"
+    rm -f "$config/Caddyfile.next"
     if [[ -n $(dc ps --status running -q caddy) ]]; then dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null; fi
   fi
-}
+)
 network_setup() {
   local port
   if [[ -f $ROOT/state/network-backup/state ]]; then
@@ -558,7 +624,7 @@ EOF
     confirm '新 SSH 已登录成功？' || die '未确认，等待网络回退；稍后用 mmwx 继续。'
     confirm_network
   else
-    info '新终端运行 mmwx，在菜单中确认 SSH。'
+    info '新 SSH 终端运行：mmwx confirm-network'
     local attempt
     for ((attempt=0; attempt<56; attempt++)); do
       [[ $(cat "$ROOT/state/network-backup/state") == confirmed ]] && break
@@ -585,17 +651,27 @@ confirm_network() {
   info '已确认 SSH，取消网络自动回退。'
 }
 install_command() {
-  if [[ $SELF != /usr/local/sbin/mmwx-installer ]]; then install -m 0700 "$SELF" /usr/local/sbin/mmwx-installer; fi
+  if [[ $SELF != /usr/local/sbin/mmwx-installer ]]; then
+    local staged
+    staged=$(mktemp /usr/local/sbin/.mmwx-installer.XXXXXX)
+    install -m 0700 "$SELF" "$staged"
+    mv -f "$staged" /usr/local/sbin/mmwx-installer
+  fi
   if [[ -e /usr/local/bin/mmwx || -L /usr/local/bin/mmwx ]]; then
     [[ $(readlink -f /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]] || die '已有 mmwx 命令，未覆盖。'
   else ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx; fi
 }
 install_units() {
   install_command
+  install -d -m 0700 /usr/local/lib/mmwx-installer
+  local runtime
+  runtime=$(mktemp /usr/local/lib/mmwx-installer/.runtime.XXXXXX)
+  install -m 0700 "$SELF" "$runtime"
+  mv -f "$runtime" /usr/local/lib/mmwx-installer/runtime.sh
   install -d /etc/systemd/system/docker.service.d
   cat > /etc/systemd/system/docker.service.d/mmwx-firewall.conf <<'EOF'
 [Service]
-ExecStartPre=/usr/local/sbin/mmwx-installer firewall-apply
+ExecStartPre=/usr/local/lib/mmwx-installer/runtime.sh firewall-apply
 EOF
   cat > /etc/systemd/system/mmwx-firewall.service <<'EOF'
 [Unit]
@@ -605,7 +681,7 @@ PartOf=docker.service ufw.service
 Before=mmwx-stack.service
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/mmwx-installer firewall-apply
+ExecStart=/usr/local/lib/mmwx-installer/runtime.sh firewall-apply
 RemainAfterExit=yes
 [Install]
 WantedBy=docker.service ufw.service multi-user.target
@@ -616,7 +692,7 @@ Description=Refresh MMWX Cloudflare IPv4 allowlist
 After=network-online.target docker.service
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/mmwx-installer firewall-sync
+ExecStart=/usr/local/lib/mmwx-installer/runtime.sh firewall-sync
 EOF
   cat > /etc/systemd/system/mmwx-cf-sync.timer <<'EOF'
 [Unit]
@@ -727,7 +803,7 @@ install_stack() {
   if ((STAGE<3)); then choose_version; checkpoint 3; fi
   if ((STAGE<4)); then
     build_caddy
-    docker pull "$PG_IMAGE"
+    run_step '下载 PostgreSQL 镜像' docker pull "$PG_IMAGE"
     PG_IMAGE=$(docker image inspect "$PG_IMAGE" --format '{{index .RepoDigests 0}}')
     checkpoint 4
   fi
@@ -745,7 +821,7 @@ install_stack() {
   render_caddy > "$ROOT/config/Caddyfile"
   save_state
   checkpoint 6
-  dc up -d --wait --wait-timeout 300
+  run_step '启动服务' dc up -d --wait --wait-timeout 300
   verify_https
   checkpoint 7
   printf '\n安装完成：https://%s\n管理菜单：mmwx\n数据库由环境变量管理，无需勾选「使用 PG 数据库」。\n' "$DOMAIN"
@@ -765,7 +841,7 @@ recover_update() {
     deploying|restoring)
       [[ -s $backup/database.dump && -s $backup/files.tar.gz ]] || die '更新备份不完整，停止恢复。'
       write_update_progress restoring "$backup"
-      dc stop mmwx caddy
+      run_step '停止主控和网关' dc stop mmwx caddy
       dc up -d --wait --wait-timeout 120 postgres
       dc exec -T postgres dropdb -U mmwx --if-exists --force mmwx
       dc exec -T postgres createdb -U mmwx -O mmwx mmwx
@@ -789,7 +865,7 @@ recover_update() {
   load_state
   render_compose > "$ROOT/config/compose.yaml.tmp"
   mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
-  dc up -d --wait --wait-timeout 300
+  run_step '启动服务' dc up -d --wait --wait-timeout 300
   rm -f "$ROOT/state/update.json"
   info "已恢复更新前的版本。备份：$backup"
 }
@@ -808,7 +884,7 @@ update_stack() {
   backup=$(mktemp -d "$ROOT/backups/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
   cp "$ROOT/config/compose.yaml" "$ROOT/state/state.json" "$backup/"
   write_update_progress backing-up "$backup"
-  dc stop mmwx caddy
+  run_step '停止主控和网关' dc stop mmwx caddy
   if ! dc exec -T postgres pg_dump -U mmwx -d mmwx -Fc > "$backup/database.dump"; then
     dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '数据库备份失败，已重新启动旧版本。'
   fi
@@ -818,7 +894,7 @@ update_stack() {
   write_update_progress deploying "$backup"
   render_compose > "$ROOT/config/compose.yaml.tmp"
   mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
-  if dc up -d --wait --wait-timeout 300; then
+  if run_step '启动服务' dc up -d --wait --wait-timeout 300; then
     save_state
     rm -f "$ROOT/state/update.json"
     sync_cf; info "更新完成：$VERSION。备份：$backup"
@@ -851,17 +927,17 @@ finish_image_rollback() {
   VERSION=$(jq -er .version "$ROOT/state/image-rollback.json")
   APP_IMAGE=$(jq -er .app "$ROOT/state/image-rollback.json")
   CHANNEL=$(jq -er .channel "$ROOT/state/image-rollback.json")
-  docker pull "$APP_IMAGE"
+  run_step "检查目标主控 $VERSION" docker pull "$APP_IMAGE"
   render_compose > "$ROOT/config/compose.yaml.tmp"
   mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
   # Only recreate the controller. PostgreSQL, Caddy and all persisted data stay in place.
-  if ! dc up -d --no-deps --wait --wait-timeout 300 mmwx; then
+  if ! run_step '切换主控容器' dc up -d --no-deps --wait --wait-timeout 300 mmwx; then
     # state.json still points to the pre-rollback controller; leave data untouched.
     CHANNEL=''
     load_state
     render_compose > "$ROOT/config/compose.yaml.tmp"
     mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
-    dc up -d --no-deps --wait --wait-timeout 300 mmwx || die '原主控也未能启动，请检查日志后重试恢复。'
+    run_step '切换主控容器' dc up -d --no-deps --wait --wait-timeout 300 mmwx || die '原主控也未能启动，请检查日志后重试恢复。'
     rm -f "$ROOT/state/image-rollback.json"
     die '回退版本未通过健康检查，已切回原主控，未还原数据。'
   fi
@@ -874,27 +950,20 @@ rollback_stack() {
   preflight; load_state
   [[ ! -f $ROOT/state/update.json ]] || die '请先恢复未完成的更新。'
   if [[ -f $ROOT/state/image-rollback.json ]]; then finish_image_rollback; return; fi
-  local snapshot version number index=0
-  local -a choices=()
-  while IFS= read -r snapshot; do
-    version=$(jq -er .version "$snapshot") || continue
-    [[ $(jq -r .app "$snapshot") != "$APP_IMAGE" ]] || continue
-    choices+=("$snapshot")
-    index=$((index+1))
-    printf '%s. %s (%s)\n' "$index" "$version" "$(basename "$(dirname "$snapshot")")"
-    [[ $index -lt 5 ]] || break
-  done < <(find "$ROOT/backups" -mindepth 2 -maxdepth 2 -name state.json -type f 2>/dev/null | sort -r)
-  [[ $index -gt 0 ]] || die '暂无历史版本。可在更新中选择近期版本。'
-  number=$(ask '回退版本编号：')
-  [[ $number =~ ^[1-5]$ && $number -le $index ]] || die '无效编号。'
-  snapshot=${choices[$((number-1))]}
-  confirm '只回退主控版本，保留当前数据；旧版本可能不兼容当前数据库。继续？' || return 0
-  jq '{version,app,channel}' "$snapshot" > "$ROOT/state/image-rollback.json.tmp"
+  local pages current=$VERSION
+  pages=$(fetch_releases 5) || die '无法读取官方版本，请检查 GitHub 网络后重试。'
+  select_version_menu "$pages"
+  [[ $VERSION != "$current" ]] || { info '选择的是当前版本，无需切换。'; return; }
+  confirm "主控 $current → $VERSION，保留当前数据。继续？" || return 0
+  pull_app_version
+  jq -n --arg version "$VERSION" --arg app "$APP_IMAGE" --arg channel "$CHANNEL" '{version:$version,app:$app,channel:$channel}' > "$ROOT/state/image-rollback.json.tmp"
   mv "$ROOT/state/image-rollback.json.tmp" "$ROOT/state/image-rollback.json"
   finish_image_rollback
 }
 remove_services() {
-  if [[ -f $ROOT/config/compose.yaml ]]; then dc down; fi
+  if [[ -f $ROOT/config/compose.yaml ]]; then run_step '移除容器' dc down; fi
+  systemctl stop mmwx-cf-sync.timer mmwx-cf-sync.service 2>/dev/null || true
+  exec 8>/run/mmwx-cf.lock; flock -w 180 8 || die '防火墙正在更新，请稍后重试卸载。'
   systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
   if [[ -f $ROOT/state/network-backup/state && $(cat "$ROOT/state/network-backup/state") == pending ]]; then
     /bin/bash "$ROOT/state/network-backup/rollback.sh"
@@ -917,6 +986,8 @@ purge_installation() {
   rm -rf --one-file-system -- "$ROOT"
   if [[ -L /usr/local/bin/mmwx && $(readlink /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]]; then rm -f /usr/local/bin/mmwx; fi
   rm -f /usr/local/sbin/mmwx-installer
+  rm -f /usr/local/lib/mmwx-installer/runtime.sh
+  if [[ -d /usr/local/lib/mmwx-installer ]]; then rmdir /usr/local/lib/mmwx-installer 2>/dev/null || true; fi
   if command -v docker >/dev/null; then
     docker image rm mmwx-installer-caddy:2.11.4-cf0.2.4 >/dev/null 2>&1 || true
   fi
@@ -942,9 +1013,17 @@ uninstall_stack() {
     info "已卸载容器，数据保留于 $ROOT。运行 mmwx 选择恢复服务。"
   fi
 }
+uninstall_script() {
+  confirm '移除 mmwx 管理命令？容器、数据和后台防火墙继续保留。' || return 0
+  # Existing installations may still reference the manager from systemd.
+  if [[ -f /etc/systemd/system/mmwx-cf-sync.timer || -f /etc/systemd/system/docker.service.d/mmwx-firewall.conf ]]; then install_units; fi
+  if [[ -L /usr/local/bin/mmwx && $(readlink /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]]; then rm -f /usr/local/bin/mmwx; fi
+  rm -f /usr/local/sbin/mmwx-installer
+  info '管理命令已移除。重新下载并运行安装脚本即可恢复管理。'
+}
 usage() {
   cat <<'EOF'
-用法：mmwx（管理菜单）或 sudo bash install.sh [install|update|uninstall|status|logs|resume|check]
+用法：mmwx（管理菜单）或 sudo bash install.sh [install|update|rollback|uninstall|status|logs|resume|check|self-update|uninstall-script]
   --prefix mmwx              子域名前缀（交互输入回车默认 mmwx）
   --zone example.com         Token 授权多个主域名时指定主域名
   --domain panel.example.com  兼容完整域名参数
@@ -970,9 +1049,25 @@ resume_task() {
     render_compose > "$ROOT/config/compose.yaml.tmp"
     mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
     dc config --quiet
-    sync_cf; dc up -d --wait --wait-timeout 300; verify_https
+    sync_cf; run_step '启动服务' dc up -d --wait --wait-timeout 300; verify_https
     info "已恢复：https://$DOMAIN"
   fi
+}
+menu_header() {
+  local state=$ROOT/state/state.json version='未安装' domain='' task=''
+  [[ -f $state ]] || state=$ROOT/state.json
+  if command -v jq >/dev/null && [[ -f $state ]]; then
+    version=$(jq -r '.version // "未知"' "$state" 2>/dev/null) || version='未知'
+    domain=$(jq -r '.domain // ""' "$state" 2>/dev/null) || domain=''
+  fi
+  if [[ -f $ROOT/state/image-rollback.json ]]; then task='版本切换待继续';
+  elif [[ -f $ROOT/state/update.json ]]; then task='更新恢复待继续';
+  elif command -v jq >/dev/null && [[ -f $ROOT/state/progress.json ]] && [[ $(jq -r .stage "$ROOT/state/progress.json") != 7 ]]; then task='安装待继续'; fi
+  section "妙妙屋 X  ·  管理脚本 v$SCRIPT_VERSION"
+  printf '  主控  %s\n' "$version"
+  [[ -z $domain ]] || printf '  访问  https://%s\n' "$domain"
+  [[ -z $task ]] || printf '  任务  %s（菜单 5）\n' "$task"
+  printf '\n'
 }
 menu() {
   local choice action
@@ -983,17 +1078,19 @@ menu() {
   [[ -z $ZONE_NAME ]] || arguments+=(--zone "$ZONE_NAME")
   [[ -z $CHANNEL ]] || arguments+=(--channel "$CHANNEL")
   while true; do
-    printf '\n妙妙屋 X\n1. 安装 / 继续安装\n2. 更新版本\n3. 状态\n4. 日志\n5. 继续任务 / 恢复服务\n6. 卸载\n7. 确认新 SSH 连接\n8. 更新管理脚本\n9. 回退主控版本\n0. 退出\n'
+    menu_header
+    printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    9  回退主控版本\n\n  管理\n    8  更新管理脚本\n    6  卸载服务\n   10  卸载管理脚本\n\n    0  退出\n\n'
     choice=$(ask '选择：')
     case "$choice" in
       1) action=install;; 2) action=update;; 3) action=status;; 4) action=logs;;
       5) action=resume;; 6) action=uninstall;;
-      7) confirm '已通过 IPv4 重新登录成功？' || continue; action=confirm-network;;
       8) action=self-update;; 9) action=rollback;;
+      10) action=uninstall-script;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
     esac
     if /bin/bash "$SELF" "$action" "${arguments[@]}"; then
       if [[ $action == self-update ]]; then exec /bin/bash /usr/local/sbin/mmwx-installer; fi
+      if [[ $action == uninstall-script ]]; then return 0; fi
     else info '操作未完成，可从菜单重试。'; fi
     [[ -f $SELF ]] || return 0
   done
@@ -1001,26 +1098,28 @@ menu() {
 main() {
   while (($#)); do
     case "$1" in
-      install|update|uninstall|status|logs|resume|check|self-update|rollback|firewall-apply|firewall-sync|confirm-network) ACTION=$1; shift;;
+      install|update|uninstall|status|logs|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network) ACTION=$1; shift;;
       --yes) ACCEPT=1; shift;;
       --domain|--prefix|--zone|--channel|--cf-token-file)
         [[ $# -ge 2 ]] || die "缺少参数：$1"
         case "$1" in --domain) DOMAIN=$2;; --prefix) PREFIX=$2;; --zone) ZONE_NAME=$2;; --channel) CHANNEL=$2; CHANNEL_EXPLICIT=1;; --cf-token-file) TOKEN_FILE=$2;; esac; shift 2;;
+      -v|--version) printf 'mmwx-installer %s\n' "$SCRIPT_VERSION"; return;;
       -h|--help) usage; return;; *) die "未知参数：$1";;
     esac
   done
   [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
   if [[ -z $ACTION ]]; then menu; return; fi
-  case "$ACTION" in install|update|uninstall|resume|self-update|rollback) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  case "$ACTION" in install|update|uninstall|resume|self-update|uninstall-script|rollback) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
   if [[ $ACTION == install && ! -f $ROOT/state/progress.json ]]; then
     printf '\033[1;31m仅限全新环境：启用 UFW、禁用 IPv6；请用 IPv4 SSH。\033[0m\n'
     if [[ $ACCEPT == 0 ]]; then confirm '开始安装？' || return 0; fi
   fi
   case "$ACTION" in
-    firewall-apply) exec 8>/run/mmwx-cf.lock; flock 8; apply_firewall;; firewall-sync) sync_cf;; confirm-network) confirm_network;;
+    firewall-apply) apply_firewall;; firewall-sync) sync_cf;; confirm-network) confirm_network;;
     check) preflight; info '环境预检通过。';;
     install) install_stack;; update) update_stack;; uninstall) uninstall_stack;;
     self-update) self_update;; rollback) rollback_stack;;
+    uninstall-script) uninstall_script;;
     status) load_state; dc ps; ufw status;; logs) load_state; dc logs --tail 80 caddy mmwx;;
     resume) resume_task;;
   esac
