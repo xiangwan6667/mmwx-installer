@@ -19,7 +19,7 @@ printf 'POSTGRES_PASSWORD=%s\n' "$password" > "$ROOT/postgres.env"
 touch "$ROOT/caddy.env"
 render_compose > "$ROOT/compose.yaml"
 printf ':80 {\n reverse_proxy mmwx:12889\n}\n' > "$ROOT/Caddyfile"
-docker compose -p mmwx-smoke -f "$ROOT/compose.yaml" config --format json | jq '.services.caddy.ports=[{target:80,published:"18080",host_ip:"127.0.0.1",protocol:"tcp"}] | (.services[].restart)="no"' > "$ROOT/compose.json"
+docker compose -p mmwx-smoke -f "$ROOT/compose.yaml" config --format json | jq '.services.caddy.ports=[{target:80,published:"18080",host_ip:"127.0.0.1",protocol:"tcp"}] | (.services[].restart)="no" | (.services[].cgroup_parent)="mmwx-test.slice" | (.services[].cpus)=0.10' > "$ROOT/compose.json"
 docker compose -p mmwx-smoke -f "$ROOT/compose.json" up -d --wait --wait-timeout 300
 curl -fsS http://127.0.0.1:18080/ -o /dev/null
 echo 'PASS: official stable image, PostgreSQL and Caddy bridge proxy'
