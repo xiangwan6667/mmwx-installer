@@ -635,7 +635,7 @@ install_stack() {
   dc up -d --wait --wait-timeout 300
   verify_https
   checkpoint 7
-  printf '\n安装完成：https://%s\n管理菜单：mmwx\n' "$DOMAIN"
+  printf '\n安装完成：https://%s\n管理菜单：mmwx\n数据库由环境变量管理，无需勾选「使用 PG 数据库」。\n' "$DOMAIN"
 }
 write_update_progress() {
   jq -n --arg phase "$1" --arg backup "$2" '{phase:$phase,backup:$backup}' > "$ROOT/update.json.tmp"
