@@ -4,6 +4,8 @@ cd "$(dirname "$0")/.."
 source ./install.sh
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 ROOT=$tmp
+# Real function comes from install.sh; a dependency-test stub replaces it later.
+# shellcheck disable=SC2218
 run_step '下载测试' bash -c 'printf "layer-details\n"' > "$tmp/screen"
 if grep -q layer-details "$tmp/screen"; then echo 'Verbose output leaked'; exit 1; fi
 grep -q layer-details "$ROOT"/state/logs/*.log
