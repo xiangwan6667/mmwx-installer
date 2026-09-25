@@ -14,7 +14,7 @@
 
 </div>
 
-通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.7**。
+通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.8**。
 
 ## 功能
 
@@ -52,7 +52,7 @@
 以 **root** 执行以下一行命令：
 
 ```bash
-bash -o pipefail -c 'if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then apt-get update && apt-get install -y ca-certificates curl || exit; fi; curl -fsSL https://raw.githubusercontent.com/xiangwan6667/mmwx-installer/main/bootstrap.sh | bash'
+bash -o pipefail -c 'if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then apt-get update && apt-get install -y ca-certificates curl || exit; fi; curl -fsSL https://github.com/xiangwan6667/mmwx-installer/releases/latest/download/bootstrap.sh | bash'
 ```
 
 入口会安装管理程序并注册 `mmwx` 命令，无需保留本地下载副本。
@@ -93,7 +93,7 @@ root 用户直接运行 `mmwx`。
 
 脚本会先检查镜像是否发布并支持本机架构。最新版镜像未就绪时，在同一通道最近 5 个版本中寻找上一可用版本，经 `y/n` 确认后使用；指定版本不可用时，可重试或重选。网络、限流和鉴权错误会停止操作。更新前完成镜像检查和下载，选择的镜像与当前运行版本相同时无需重启服务。
 
-更新管理脚本使用菜单 **9**（v0.2.4 为菜单 8，v0.2.3 及更早版本为菜单 7）；旧版没有此入口时，重新执行上方安装命令即可。脚本版本可用 `mmwx --version` 查看，命令参数见 `mmwx --help`。
+更新管理脚本使用菜单 **9**（v0.2.4 为菜单 8，v0.2.3 及更早版本为菜单 7）；旧版没有此入口时，重新执行上方安装命令即可。管理脚本从 GitHub Releases 的最新稳定版本下载，并在安装前按同一发布版本的 `SHA256SUMS` 校验文件及脚本版本。脚本版本可用 `mmwx --version` 查看，命令参数见 `mmwx --help`。
 
 ### Caddy 管理
 

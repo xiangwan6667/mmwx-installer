@@ -17,7 +17,7 @@ CHANNEL='' ACTION=install
 choose_version >/dev/null
 [[ $VERSION == v21 && $CHANNEL == stable ]]
 # A failed or invalid download must never replace the installed manager.
-get() { printf 'not a shell script\n' > "${@: -1}"; }
+get() { return 1; }
 if (self_update) >/dev/null 2>&1; then echo 'Invalid script accepted'; exit 1; fi
 # Rollback chooses an official release even without any installation history.
 preflight() { :; }

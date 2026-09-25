@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.7
+SCRIPT_VERSION=0.2.8
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -1244,32 +1244,59 @@ finish_reinstall() {
   rm -f "$ROOT/state/reinstall.json"
   info "妙妙屋重装完成：$VERSION。数据、配置、证书和凭据均保留。"
 }
+download_installer_release() {
+  local directory=$1 base=https://github.com/xiangwan6667/mmwx-installer url tag expected actual
+  # Resolve latest once, then pin BOTH assets to that stable release. This uses
+  # the website redirect and does not consume the anonymous GitHub API quota.
+  url=$(get "$base/releases/latest" -o /dev/null -w '%{url_effective}') || { printf '无法查询正式 Release。\n' >&2; return 1; }
+  [[ $url =~ ^https://github.com/xiangwan6667/mmwx-installer/releases/tag/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]] || { printf '正式 Release 地址无效。\n' >&2; return 1; }
+  tag=${BASH_REMATCH[1]}
+  if ! get "$base/releases/download/$tag/install.sh" -o "$directory/install.sh" ||
+     ! get "$base/releases/download/$tag/SHA256SUMS" -o "$directory/SHA256SUMS"; then
+    printf 'Release %s 下载失败，请稍后重试。\n' "$tag" >&2; return 1
+  fi
+  expected=$(awk '
+    $2 == "install.sh" || $2 == "*install.sh" { if (NF != 2) exit 1; count++; hash=$1 }
+    END { if (count != 1 || length(hash) != 64 || hash ~ /[^0-9a-fA-F]/) exit 1; print tolower(hash) }
+  ' "$directory/SHA256SUMS") || { printf 'Release 校验文件无效。\n' >&2; return 1; }
+  actual=$(sha256sum "$directory/install.sh") || return 1
+  [[ ${actual%% *} == "$expected" ]] || { printf 'Release SHA-256 校验失败。\n' >&2; return 1; }
+  if ! head -1 "$directory/install.sh" | grep -qx '#!/usr/bin/env bash' ||
+     ! bash -n "$directory/install.sh" ||
+     ! grep -qx '# Independent installer. Never invoke the upstream install script.' "$directory/install.sh" ||
+     ! grep -Eq '^self_update\(\) [({]$' "$directory/install.sh" ||
+     [[ $(grep -c '^SCRIPT_VERSION=' "$directory/install.sh") != 1 ]] ||
+     ! grep -qxF "SCRIPT_VERSION=${tag#v}" "$directory/install.sh"; then
+    printf 'Release 脚本格式或版本不匹配。\n' >&2; return 1
+  fi
+  printf '%s\n' "$tag"
+}
+# Keep the brace signature accepted by older managers during this upgrade.
 self_update() {
-  local downloaded staged
-  downloaded=$(mktemp)
-  if ! get https://raw.githubusercontent.com/xiangwan6667/mmwx-installer/main/install.sh -o "$downloaded"; then
-    rm -f "$downloaded"; die '下载失败，保留当前管理脚本。'
-  fi
-  if ! head -1 "$downloaded" | grep -qx '#!/usr/bin/env bash' || ! bash -n "$downloaded" || ! grep -q '^self_update() {' "$downloaded"; then
-    rm -f "$downloaded"; die '管理脚本校验失败，保留当前版本。'
-  fi
-  if [[ -e /usr/local/bin/mmwx || -L /usr/local/bin/mmwx ]]; then
-    [[ $(readlink -f /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]] || { rm -f "$downloaded"; die '已有其他 mmwx 命令。'; }
-  fi
-  if cmp -s "$downloaded" /usr/local/sbin/mmwx-installer; then
-    rm -f "$downloaded"
-    [[ -L /usr/local/bin/mmwx ]] || ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx
+  (
+    local temporary downloaded staged='' tag
+    temporary=$(mktemp -d) || die '无法创建更新临时目录。'
+    trap 'rm -rf -- "$temporary"; [[ -z $staged ]] || rm -f -- "$staged"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    tag=$(download_installer_release "$temporary") || die '更新失败，保留当前管理脚本。'
+    downloaded=$temporary/install.sh
+    if [[ -e /usr/local/bin/mmwx || -L /usr/local/bin/mmwx ]]; then
+      [[ $(readlink -f /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]] || die '已有其他 mmwx 命令。'
+    fi
+    if cmp -s "$downloaded" /usr/local/sbin/mmwx-installer; then
+      [[ -L /usr/local/bin/mmwx ]] || ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx || return 1
+      cleanup_downloads
+      info '已经是最新版。'
+      return 0
+    fi
+    staged=$(mktemp /usr/local/sbin/.mmwx-installer.XXXXXX) || die '无法暂存更新，保留当前版本。'
+    install -m 0700 "$downloaded" "$staged" || die '无法暂存更新，保留当前版本。'
+    mv -f "$staged" /usr/local/sbin/mmwx-installer || die '无法替换管理脚本，保留当前版本。'
+    [[ -L /usr/local/bin/mmwx ]] || ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx || return 1
     cleanup_downloads
-    info '已经是最新版。'
-    return 0
-  fi
-  staged=$(mktemp /usr/local/sbin/.mmwx-installer.XXXXXX)
-  install -m 0700 "$downloaded" "$staged"
-  rm -f "$downloaded"
-  mv -f "$staged" /usr/local/sbin/mmwx-installer
-  [[ -L /usr/local/bin/mmwx ]] || ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx
-  cleanup_downloads
-  info '管理脚本已更新。'
+    info "管理脚本已更新：$tag。"
+  )
 }
 finish_image_rollback() {
   load_state
@@ -1621,6 +1648,7 @@ usage() {
   --yes                      接受全新环境提示；必须五分钟内另开 SSH 执行 confirm-network
 安装需确认新 SSH 连接；check 只检查环境，不修改系统。
 reinstall 重新拉取当前版本镜像，仅重建妙妙屋容器，保留全部数据和配置。
+self-update 从最新正式 Release 更新管理脚本，并校验 SHA-256。
 caddy 打开网关管理菜单；caddy-token --cf-token-file /root/token 替换 Token。
 caddy-status / caddy-logs / caddy-reload / caddy-restart / caddy-certificates 可直接执行。
 EOF
