@@ -16,11 +16,13 @@ jobs:
       - run: sudo bash tests/entrypoint.sh && sudo bash tests/self-update.sh
       - run: sudo bash tests/registry.sh && sudo bash tests/available-version.sh
       - run: sudo bash tests/reinstall.sh
+      - run: sudo bash tests/caddy-management.sh && sudo bash tests/caddy-token.sh && sudo bash tests/caddy-lock.sh
   runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y ufw ipset jq
       - run: sudo bash tests/persistence.sh
+      - run: sudo bash tests/caddy-runtime.sh
       - run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT bash tests/firewall-live.sh

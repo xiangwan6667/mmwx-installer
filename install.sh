@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.4
+SCRIPT_VERSION=0.2.5
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -45,7 +45,7 @@ is_yes() { [[ $1 == y || $1 == Y ]]; }
 confirm() {
   local answer
   while true; do
-    answer=$(ask "$1 [y/n]：")
+    answer=$(ask "$1 [y/n]：") || return 1
     case "$answer" in y|Y) return 0;; n|N|'') return 1;; *) printf '请输入 y 或 n。\n' >&2;; esac
   done
 }
@@ -654,6 +654,7 @@ remove_legacy_cf_rules() {
 }
 sync_cf() (
   exec 8>/run/mmwx-cf.lock; flock -w 180 8 || { info 'CF 规则正在更新，请稍后重试。'; return 1; }
+  if [[ -e $ROOT/state/caddy-token-change ]]; then info 'Token 替换待恢复，本次 CF 同步跳过。'; return 0; fi
   local state=$ROOT/state config=$ROOT/config
   if [[ ! -f $state/state.json && -f $ROOT/state.json ]]; then state=$ROOT; config=$ROOT; fi
   local old=$state/cloudflare-v4.txt new=$state/cloudflare-v4.new
@@ -666,7 +667,7 @@ sync_cf() (
     # Keep the inode: Caddy mounts this individual file.
     cat "$config/Caddyfile.next" > "$config/Caddyfile"
     rm -f "$config/Caddyfile.next"
-    if [[ -n $(dc ps --status running -q caddy) ]]; then run_step '重载 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile; fi
+    if [[ -n $(dc ps --status running -q caddy) ]]; then caddy_step '重载 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile; fi
   fi
 )
 network_setup() {
@@ -904,6 +905,7 @@ prepare_secrets() {
   fi
 }
 install_stack() {
+  caddy_token_pending_guard
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight
@@ -1012,6 +1014,7 @@ recover_update() {
   info "已恢复更新前的版本。备份：$backup"
 }
 update_stack() {
+  caddy_token_pending_guard
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight
@@ -1051,6 +1054,7 @@ update_stack() {
   fi
 }
 reinstall_stack() {
+  caddy_token_pending_guard
   [[ ! -f $ROOT/state.json && ! -f $ROOT/progress.json && ! -d $ROOT/.layout-migration ]] || die '旧版目录需先通过菜单 5 完成迁移，再重装主控。'
   ensure_layout
   preflight
@@ -1134,6 +1138,7 @@ finish_image_rollback() {
   info "主控已切换至 $VERSION，数据库和文件未还原。"
 }
 rollback_stack() {
+  caddy_token_pending_guard
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight; load_state
@@ -1184,6 +1189,7 @@ purge_installation() {
   fi
 }
 uninstall_stack() {
+  caddy_token_pending_guard
   [[ -d $ROOT ]] || die '未发现安装目录。'
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
@@ -1214,9 +1220,222 @@ uninstall_script() {
   cleanup_downloads
   info '管理命令已移除。重新下载并运行安装脚本即可恢复管理。'
 }
+# Caddy management: read-only inspection and narrowly scoped service operations.
+caddy_redact() (
+  set +x
+  python3 -c '
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+paths = [root / "config/cloudflare.token", root / "config/caddy.env"]
+paths += [root / "state/caddy-token-change" / name for name in
+          ("old.token", "old.env", "candidate.token", "candidate.env")]
+secrets = set()
+try:
+    for path in paths:
+        if not path.exists():
+            continue
+        value = path.read_text(encoding="utf-8")
+        if path.suffix == ".env":
+            for line in value.splitlines():
+                key, separator, token = line.partition("=")
+                if separator and key.strip() == "CF_API_TOKEN":
+                    token = token.strip().strip(chr(34) + chr(39))
+                    if token: secrets.add(token)
+        elif value.strip():
+            secrets.add(value.strip())
+except (OSError, UnicodeError):
+    print("无法读取脱敏凭据，已隐藏命令输出。", file=sys.stderr)
+    sys.exit(1)
+for line in sys.stdin:
+    for token in sorted(secrets, key=len, reverse=True):
+        line = line.replace(token, "[REDACTED]")
+    sys.stdout.write(line)
+' "$ROOT"
+)
+caddy_redacted_command() (
+  set +x
+  set -o pipefail
+  "$@" 2>&1 | caddy_redact
+)
+caddy_step() (
+  set +x
+  local label=$1
+  shift
+  # Filtering happens inside the logged command, before run_step writes to disk.
+  run_step "$label" caddy_redacted_command "$@"
+)
+caddy_validate_config() {
+  caddy_step '校验 Caddy 配置' dc exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+}
+caddy_ready() {
+  python3 - "$ROOT" "$DOMAIN" <<'PY'
+import socket, ssl, subprocess, sys, time
+root, domain = sys.argv[1:]
+deadline = time.monotonic() + 60
+command = ["docker", "compose", "--project-name", "mmwx-installer",
+           "--project-directory", root + "/config", "-f", root + "/config/compose.yaml",
+           "ps", "--status", "running", "-q", "caddy"]
+reason = "Caddy 未运行"
+while time.monotonic() < deadline:
+    remaining = deadline - time.monotonic()
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=min(5, remaining), check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            reason = "Caddy 未运行或状态不可读"
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: break
+            context = ssl.create_default_context()
+            with socket.create_connection(("127.0.0.1", 443), timeout=min(3, remaining)) as sock:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: break
+                sock.settimeout(min(3, remaining))
+                with context.wrap_socket(sock, server_hostname=domain):
+                    print("Caddy 已运行，本机源站 TLS 证书与域名验证通过。")
+                    sys.exit(0)
+    except ssl.SSLCertVerificationError:
+        reason = "本机源站 TLS 证书或域名信任验证失败"
+    except (OSError, ssl.SSLError, subprocess.SubprocessError):
+        reason = "Caddy 状态或本机源站 TLS 连接未就绪"
+    remaining = deadline - time.monotonic()
+    if remaining > 0: time.sleep(min(1, remaining))
+print("Caddy 在 60 秒内未就绪：" + reason + "。", file=sys.stderr)
+sys.exit(1)
+PY
+}
+caddy_certificate_probe() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import datetime, math, os, socket, ssl, sys, tempfile
+source, host, domain = sys.argv[1:]
+label = "源站（本机 127.0.0.1）" if source == "origin" else "Cloudflare 边缘（公网 DNS）"
+print(label + "；SNI=" + domain)
+def connection_error(error):
+    if isinstance(error, socket.gaierror):
+        return "DNS 解析失败"
+    if isinstance(error, ConnectionRefusedError):
+        return "连接被拒绝，请检查服务及 443 端口"
+    if isinstance(error, TimeoutError):
+        return "连接超时，请检查网络和防火墙"
+    if isinstance(error, ssl.SSLError):
+        return "TLS 握手失败，请检查 HTTPS 配置"
+    return "网络连接失败，请检查服务和网络"
+def connect(context):
+    with socket.create_connection((host, 443), timeout=5) as sock:
+        with context.wrap_socket(sock, server_hostname=domain) as tls:
+            return tls.getpeercert(), tls.getpeercert(binary_form=True)
+verified = True
+try:
+    cert, _ = connect(ssl.create_default_context())
+except ssl.SSLCertVerificationError:
+    verified = False
+    print("  信任验证失败；以下为未验证的证书信息。")
+    try:
+        _, der = connect(ssl._create_unverified_context())
+        # The unverified TLS API provides DER only; decode a private temporary PEM.
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as pem:
+                path = pem.name
+                pem.write(ssl.DER_cert_to_PEM_cert(der))
+            cert = ssl._ssl._test_decode_cert(path)
+        finally:
+            if path: os.unlink(path)
+    except (OSError, ssl.SSLError) as error:
+        print("  无法读取未验证证书：" + connection_error(error) + "。")
+        sys.exit(1)
+    except ValueError:
+        print("  未验证证书格式异常。")
+        sys.exit(1)
+except (OSError, ssl.SSLError) as error:
+    print("  " + connection_error(error) + "。")
+    sys.exit(1)
+except ValueError:
+    print("  证书格式异常。")
+    sys.exit(1)
+try:
+    before = ssl.cert_time_to_seconds(cert["notBefore"])
+    after = ssl.cert_time_to_seconds(cert["notAfter"])
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    days = math.floor((after - now) / 86400)
+    names = ", ".join(value for kind, value in cert.get("subjectAltName", ()) if kind in ("DNS", "IP Address"))
+    issuer = ", ".join(key + "=" + value for rdn in cert.get("issuer", ()) for key, value in rdn)
+    print("  SAN：" + (names or "无"))
+    print("  签发者：" + (issuer or "未知"))
+    print("  生效时间：" + cert["notBefore"])
+    print("  到期时间：" + cert["notAfter"])
+    print("  剩余天数：" + str(days))
+    if after <= now:
+        print("  状态：已过期")
+        sys.exit(1)
+    if before > now:
+        print("  状态：尚未生效")
+        sys.exit(1)
+    print("  状态：" + ("证书与域名验证通过" if verified else "未验证，不能确认可信"))
+    sys.exit(0 if verified else 1)
+except (KeyError, TypeError, ValueError, OverflowError):
+    print("  证书信息不完整，无法判定有效期。")
+    sys.exit(1)
+PY
+}
+caddy_action() {
+  local action=$1 result=0 http_status
+  case "$action" in
+    reload|restart) caddy_require_install write || return $?;;
+    status|logs|certificates) caddy_require_install read || return $?;;
+    *) printf '无效 Caddy 操作。\n' >&2; return 1;;
+  esac
+  case "$action" in
+    status)
+      section 'Caddy 运行状态'
+      printf '  域名：%s\n' "$DOMAIN"
+      caddy_redacted_command dc ps caddy || return $?
+      caddy_redacted_command dc exec -T caddy caddy version;;
+    logs) caddy_redacted_command dc logs --tail 80 caddy;;
+    reload)
+      caddy_validate_config || return $?
+      caddy_step '重载 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile || return $?
+      caddy_ready;;
+    restart)
+      confirm '重启 Caddy？HTTPS 访问将短暂中断。' || return 0
+      caddy_step '重启 Caddy' dc restart caddy || return $?
+      caddy_validate_config || return $?
+      caddy_ready;;
+    certificates)
+      caddy_redacted_command caddy_certificate_probe origin 127.0.0.1 "$DOMAIN" || result=1
+      caddy_redacted_command caddy_certificate_probe edge "$DOMAIN" "$DOMAIN" || result=1
+      printf '\n  公网 HTTPS 状态（独立于源站证书检查）：\n'
+      if http_status=$(curl --proto '=https' --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' "https://$DOMAIN/" 2>/dev/null); then
+        printf '  HTTP %s\n' "$http_status"
+      else
+        printf '  公网 HTTPS 连接失败。\n'
+        result=1
+      fi
+      return "$result";;
+  esac
+}
+caddy_menu() {
+  local choice action
+  local -a arguments=()
+  [[ -z $TOKEN_FILE ]] || arguments+=(--cf-token-file "$TOKEN_FILE")
+  while true; do
+    section 'Caddy 管理'
+    printf '    1  查看运行状态\n    2  查看最近 80 行日志\n    3  校验并重载配置\n    4  重启 Caddy\n    5  查看源站 / Cloudflare 边缘证书\n    6  更换 Cloudflare Token\n\n    0  返回\n\n'
+    choice=$(ask '选择：')
+    case "$choice" in
+      1) action=caddy-status;; 2) action=caddy-logs;; 3) action=caddy-reload;;
+      4) action=caddy-restart;; 5) action=caddy-certificates;; 6) action=caddy-token;;
+      0) return 0;; *) printf '无效选择。\n'; continue;;
+    esac
+    if /bin/bash "$SELF" "$action" "${arguments[@]}"; then :; else info '操作未完成，可从菜单重试。'; fi
+    [[ -f $SELF ]] || return 0
+  done
+}
+# End Caddy management functions.
+
 usage() {
   cat <<'EOF'
-用法：mmwx（管理菜单）或 sudo bash install.sh [install|update|reinstall|rollback|uninstall|status|logs|resume|check|self-update|uninstall-script]
+用法：mmwx（管理菜单）或 sudo bash install.sh [install|update|reinstall|rollback|uninstall|status|logs|resume|check|self-update|uninstall-script|caddy]
   --prefix mmwx              子域名前缀（交互输入回车默认 mmwx）
   --zone example.com         Token 授权多个主域名时指定主域名
   --domain panel.example.com  兼容完整域名参数
@@ -1225,9 +1444,237 @@ usage() {
   --yes                      接受全新环境提示；必须五分钟内另开 SSH 执行 confirm-network
 安装需确认新 SSH 连接；check 只检查环境，不修改系统。
 reinstall 重新拉取当前版本镜像，仅重建妙妙屋容器，保留全部数据和配置。
+caddy 打开网关管理菜单；caddy-token --cf-token-file /root/token 替换 Token。
+caddy-status / caddy-logs / caddy-reload / caddy-restart / caddy-certificates 可直接执行。
 EOF
 }
+caddy_require_install() {
+  [[ ! -f $ROOT/state.json && ! -f $ROOT/progress.json && ! -d $ROOT/.layout-migration ]] || die '旧目录请先通过菜单 5 完成迁移，再管理 Caddy。'
+  local path
+  for path in "$ROOT" "$ROOT/config" "$ROOT/state"; do
+    [[ -d $path && ! -L $path ]] || die '安装目录缺失或为符号链接。'
+  done
+  for path in compose.yaml Caddyfile caddy.env cloudflare.token; do
+    [[ -f $ROOT/config/$path && ! -L $ROOT/config/$path ]] || die "缺少常规配置文件：$path"
+  done
+  load_state
+  valid_domain "$DOMAIN" || die '安装域名无效。'
+}
+caddy_require_idle() {
+  local task
+  for task in reinstall.json update.json image-rollback.json; do
+    [[ ! -f $ROOT/state/$task ]] || die '有未完成的维护任务，请先选择菜单 5。'
+  done
+  if [[ -f $ROOT/state/progress.json ]]; then
+    [[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]] || die '请先通过菜单 5 完成安装。'
+  fi
+}
+caddy_lock_cf() { exec 8>/run/mmwx-cf.lock; flock -w 180 8 || die 'CF 同步正在运行，请稍后重试。'; }
+caddy_refresh_runtime() {
+  # Old releases updated the menu without updating the timer's private copy.
+  # Called with both maintenance/CF locks held, before any credential change.
+  local runtime=/usr/local/lib/mmwx-installer/runtime.sh staged
+  [[ -f $runtime ]] || return 0
+  cmp -s "$SELF" "$runtime" && return 0
+  staged=$(mktemp /usr/local/lib/mmwx-installer/.runtime.XXXXXX) || return 1
+  if ! install -m 0700 "$SELF" "$staged" || ! mv -f "$staged" "$runtime"; then
+    rm -f "$staged"; return 1
+  fi
+}
+caddy_token_pending_guard() {
+  [[ ! -e $ROOT/state/caddy-token-change ]] || die 'Token 替换待恢复，请先选择菜单 5。'
+}
+caddy_token_file_check() {
+  [[ -f $1 && ! -L $1 && $(stat -c %u "$1") == 0 && $(stat -c %a "$1") == 600 ]]
+}
+caddy_token_phase() {
+  local dir=$ROOT/state/caddy-token-change
+  jq --arg phase "$1" '.phase=$phase' "$dir/journal.json" > "$dir/journal.tmp" || return 1
+  mv "$dir/journal.tmp" "$dir/journal.json"
+}
+caddy_token_stage() (
+  set +x
+  local dir=$ROOT/state/caddy-token-change staging candidate=''
+  caddy_token_pending_guard
+  if ! caddy_token_file_check "$ROOT/config/cloudflare.token" || ! caddy_token_file_check "$ROOT/config/caddy.env"; then die '现有凭据必须为 root 所有、600 权限的常规文件。'; fi
+  staging=$(mktemp -d "$ROOT/state/.caddy-token-XXXXXX") || return 1
+  [[ -n $staging && -d $staging && ! -L $staging ]] || return 1
+  trap 'rm -rf -- "$staging"' EXIT
+  chmod 700 "$staging" || return 1
+  if [[ -n $TOKEN_FILE ]]; then
+    caddy_token_file_check "$TOKEN_FILE" || die 'Token 文件必须为 root 所有、600 权限的常规文件。'
+    cp "$TOKEN_FILE" "$staging/candidate.token" || return 1
+  else
+    read -r -s -p '新的 Cloudflare Token：' candidate </dev/tty || die '无法读取 Token。'
+    printf '\n' >/dev/tty
+    printf '%s\n' "$candidate" > "$staging/candidate.token" || return 1
+    unset candidate
+  fi
+  cp "$ROOT/config/cloudflare.token" "$staging/old.token" || return 1
+  cp "$ROOT/config/caddy.env" "$staging/old.env" || return 1
+  if ! python3 - "$staging" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+def token(name):
+    v = (p / name).read_text().strip()
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{20,256}', v):
+        raise ValueError()
+    return v
+try:
+    old, new = token('old.token'), token('candidate.token')
+    raw = (p / 'old.env').read_bytes()
+    matches = list(re.finditer(rb'(?m)^CF_API_TOKEN=([^\r\n]*)', raw))
+    if len(matches) != 1 or matches[0].group(1).decode() != old:
+        raise ValueError()
+    m = matches[0]
+    (p / 'candidate.env').write_bytes(raw[:m.start(1)] + new.encode() + raw[m.end(1):])
+    (p / 'candidate.token').write_bytes((new + '\n').encode())
+except Exception:
+    print('Token 格式无效或现有两份凭据不一致。', file=sys.stderr)
+    sys.exit(1)
+PY
+  then return 1; fi
+  jq -n --arg domain "$DOMAIN" '{phase:"probing",domain:$domain,zone:"",name:"",value:"",comment:""}' > "$staging/journal.json" || return 1
+  chmod 600 "$staging"/* || return 1
+  mv "$staging" "$dir" || return 1
+)
+# Request arguments contain paths only. Never retry POST: a lost response may
+# already have created the record. Recovery reconciles the exact random probe.
+caddy_token_request() (
+  set +x
+  local method=$1 endpoint=$2 payload=$3 output=$4 dir=$ROOT/state/caddy-token-change status
+  local -a args=()
+  local credential
+  credential=$(cat "$dir/candidate.token") || return 1
+  [[ -n $credential ]] || return 1
+  printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$credential" > "$dir/request.headers" || return 1
+  unset credential
+  [[ -z $payload ]] || args+=(--data-binary "@$payload")
+  status=$(curl --proto '=https' --tlsv1.2 --silent --show-error --connect-timeout 10 --max-time 30 \
+    --request "$method" --header "@$dir/request.headers" "${args[@]}" \
+    --output "$output" --write-out '%{http_code}' "https://api.cloudflare.com/client/v4$endpoint" 2> "$dir/request.error") || return 1
+  [[ $status == 2?? ]] && jq -e '.success == true' "$output" >/dev/null 2>&1
+)
+caddy_token_cleanup() {
+  local require_match=${1:-0} dir=$ROOT/state/caddy-token-change zone name id
+  [[ $(jq -r '.txt_clean // false' "$dir/journal.json") != true ]] || return 0
+  zone=$(jq -r .zone "$dir/journal.json")
+  name=$(jq -r .name "$dir/journal.json")
+  [[ -n $zone && -n $name ]] || return 0
+  caddy_token_request GET "/zones/$zone/dns_records?type=TXT&name=$name&per_page=100" '' "$dir/records.json" || return 1
+  jq -e '(.result|type)=="array" and (.result_info.total_pages // 1)<=1' "$dir/records.json" >/dev/null || return 1
+  jq -r --slurpfile j "$dir/journal.json" '.result[] | select(.type=="TXT" and .name==$j[0].name and .content==$j[0].value and .comment==$j[0].comment) | .id' "$dir/records.json" > "$dir/record-ids" || return 1
+  # A successful POST's known record must be observed before deletion. An
+  # unexpectedly empty list cannot prove it disappeared without our attempt.
+  id=$(jq -r '.record_id // ""' "$dir/journal.json") || return 1
+  if [[ -n $id && $(jq -r '.delete_started // false' "$dir/journal.json") != true ]]; then
+    grep -Fxq "$id" "$dir/record-ids" || return 1
+  fi
+  if [[ $require_match == 1 ]]; then
+    id=$(jq -er .record_id "$dir/journal.json") || return 1
+    grep -Fxq "$id" "$dir/record-ids" || return 1
+  fi
+  while IFS= read -r id; do
+    [[ $id =~ ^[a-zA-Z0-9]+$ ]] || return 1
+    jq '.delete_started=true' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json" || return 1
+    # DELETE errors may mean the successful response was lost. Confirm below.
+    caddy_token_request DELETE "/zones/$zone/dns_records/$id" '' "$dir/deleted.json" || true
+  done < "$dir/record-ids"
+  caddy_token_request GET "/zones/$zone/dns_records?type=TXT&name=$name&per_page=100" '' "$dir/records.json" || return 1
+  jq -e --slurpfile j "$dir/journal.json" '(.result|type)=="array" and (.result_info.total_pages // 1)<=1 and ([.result[] | select(.type=="TXT" and .name==$j[0].name and .content==$j[0].value and .comment==$j[0].comment)]|length)==0' "$dir/records.json" >/dev/null || return 1
+  jq '.txt_clean=true' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json"
+}
+caddy_token_probe() {
+  local dir=$ROOT/state/caddy-token-change page=1 pages zone random
+  printf '[]' > "$dir/zones.json" || return 1
+  while true; do
+    caddy_token_request GET "/zones?status=active&per_page=50&page=$page" '' "$dir/response.json" || return 1
+    jq -e '.result|type=="array"' "$dir/response.json" >/dev/null || return 1
+    jq -s '.[0] + .[1].result' "$dir/zones.json" "$dir/response.json" > "$dir/zones.tmp" || return 1
+    mv "$dir/zones.tmp" "$dir/zones.json" || return 1
+    pages=$(jq -r '.result_info.total_pages // 1' "$dir/response.json")
+    [[ $pages =~ ^[0-9]+$ && $pages -le 100 ]] || return 1
+    ((page < pages)) || break
+    page=$((page+1))
+  done
+  zone=$(jq -r --arg domain "$DOMAIN" '[.[] | select(.status=="active") | . as $z | select($domain==$z.name or ($domain|endswith("."+$z.name)))] | sort_by(.name|length) | last | .id // ""' "$dir/zones.json")
+  [[ $zone =~ ^[a-zA-Z0-9]+$ ]] || return 1
+  local value
+  random=$(openssl rand -hex 16) || return 1
+  value=$(openssl rand -hex 24) || return 1
+  jq --arg zone "$zone" --arg name "_mmwx-token-$random.$DOMAIN" --arg value "$value" --arg comment "mmwx-token-check-$random" \
+    '.zone=$zone | .name=$name | .value=$value | .comment=$comment' "$dir/journal.json" > "$dir/journal.tmp" || return 1
+  mv "$dir/journal.tmp" "$dir/journal.json" || return 1
+  jq '{type:"TXT",name:.name,content:.value,ttl:60,comment:.comment}' "$dir/journal.json" > "$dir/create.json" || return 1
+  caddy_token_request POST "/zones/$zone/dns_records" "$dir/create.json" "$dir/response.json" || return 1
+  jq -e '.result.id|type=="string" and test("^[a-zA-Z0-9]+$")' "$dir/response.json" >/dev/null || return 1
+  jq --slurpfile response "$dir/response.json" '.record_id=$response[0].result.id' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json" || return 1
+  caddy_token_cleanup 1 || return 1
+  caddy_token_phase validated
+}
+caddy_token_replace_files() {
+  local prefix=$1 dir=$ROOT/state/caddy-token-change
+  # Both temporary targets stay private and on the same filesystem as config.
+  install -m 600 "$dir/$prefix.token" "$ROOT/config/.cloudflare.token.new" &&
+    mv -f "$ROOT/config/.cloudflare.token.new" "$ROOT/config/cloudflare.token" &&
+    install -m 600 "$dir/$prefix.env" "$ROOT/config/.caddy.env.new" &&
+    mv -f "$ROOT/config/.caddy.env.new" "$ROOT/config/caddy.env"
+}
+caddy_token_discard() {
+  rm -f "$ROOT/config/.cloudflare.token.new" "$ROOT/config/.caddy.env.new"
+  rm -rf -- "$ROOT/state/caddy-token-change"
+}
+recover_caddy_token() (
+  set +x
+  local dir=$ROOT/state/caddy-token-change phase
+  caddy_require_install write
+  caddy_require_idle
+  [[ -d $dir && ! -L $dir && -f $dir/journal.json ]] || die 'Token 恢复记录缺失。'
+  phase=$(jq -er .phase "$dir/journal.json") || die 'Token 恢复记录无效。'
+  [[ $(jq -r .domain "$dir/journal.json") == "$DOMAIN" ]] || die 'Token 恢复记录的域名不匹配。'
+  case "$phase" in
+    probing|validated|committed|restored) ;;
+    applying|rollback)
+      caddy_token_phase rollback || die '无法保存恢复记录。'
+      caddy_token_replace_files old || die '旧凭据恢复失败，请重试菜单 5。'
+      if ! caddy_step '恢复 Caddy' dc up -d --no-deps --force-recreate --wait --wait-timeout 300 caddy || ! caddy_validate_config || ! caddy_ready; then die 'Caddy 恢复检查未通过，记录保留；请重试菜单 5。'; fi
+      caddy_token_phase restored || die '无法保存恢复记录。';;
+    *) die '无法识别 Token 恢复阶段，记录保留。';;
+  esac
+  caddy_token_cleanup || die '临时 TXT 清理失败，旧配置保留；请稍后重试菜单 5。'
+  caddy_token_discard || die '凭据暂存清理失败，请重试菜单 5。'
+  info 'Token 任务已恢复，证书和业务数据保留。'
+)
+caddy_token_apply() {
+  caddy_token_phase applying || return 1
+  caddy_token_replace_files candidate || return 1
+  if ! caddy_step '应用 Caddy Token' dc up -d --no-deps --force-recreate --wait --wait-timeout 300 caddy || ! caddy_validate_config || ! caddy_ready; then return 1; fi
+  caddy_token_phase committed
+}
+replace_caddy_token() (
+  set +x
+  caddy_require_install write
+  caddy_require_idle
+  caddy_token_pending_guard
+  confirm '替换 Cloudflare Token？网关会短暂中断，证书和业务数据保留。' || return 0
+  caddy_token_stage || die '无法暂存新 Token，未修改配置。'
+  if ! caddy_token_probe; then
+    if caddy_token_cleanup; then caddy_token_discard; fi
+    die 'Token 权限验证或临时 TXT 清理失败，未修改配置；有待恢复任务时请选择菜单 5。'
+  fi
+  if ! caddy_token_apply; then
+    recover_caddy_token || die '应用失败且恢复未完成，请重试菜单 5。'
+    die '新 Token 应用失败，已恢复旧配置。'
+  fi
+  caddy_token_discard || die 'Token 已生效，暂存清理失败，请通过菜单 5 清理。'
+  info 'Cloudflare Token 已替换，现有证书继续使用。'
+)
 resume_task() {
+  if [[ -e $ROOT/state/caddy-token-change ]]; then
+    caddy_lock_cf
+    caddy_refresh_runtime || die '后台程序更新失败，请重试。'
+    recover_caddy_token; return
+  fi
   ensure_layout
   install_command
   if [[ -f $ROOT/state/reinstall.json ]]; then
@@ -1256,7 +1703,8 @@ menu_header() {
     version=$(jq -r '.version // "未知"' "$state" 2>/dev/null) || version='未知'
     domain=$(jq -r '.domain // ""' "$state" 2>/dev/null) || domain=''
   fi
-  if [[ -f $ROOT/state/reinstall.json ]]; then task='镜像重装待继续';
+  if [[ -e $ROOT/state/caddy-token-change ]]; then task='Token 替换待恢复';
+  elif [[ -f $ROOT/state/reinstall.json ]]; then task='镜像重装待继续';
   elif [[ -f $ROOT/state/image-rollback.json ]]; then task='版本切换待继续';
   elif [[ -f $ROOT/state/update.json ]]; then task='更新恢复待继续';
   elif command -v jq >/dev/null && [[ -f $ROOT/state/progress.json ]] && [[ $(jq -r .stage "$ROOT/state/progress.json") != 7 ]]; then task='安装待继续'; fi
@@ -1276,12 +1724,12 @@ menu() {
   [[ -z $CHANNEL ]] || arguments+=(--channel "$CHANNEL")
   while true; do
     menu_header
-    printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n    7  强制重新安装\n\n  管理\n    8  更新管理脚本\n    9  卸载服务\n   10  卸载管理脚本\n\n    0  退出\n\n'
+    printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n    7  强制重新安装\n\n  管理\n    8  Caddy 管理\n    9  更新管理脚本\n   10  卸载服务\n   11  卸载管理脚本\n\n    0  退出\n\n'
     choice=$(ask '选择：')
     case "$choice" in
       1) action=install;; 2) action=update;; 3) action=status;; 4) action=logs;;
       5) action=resume;; 6) action=rollback;;
-      7) action=reinstall;; 8) action=self-update;; 9) action=uninstall;; 10) action=uninstall-script;;
+      7) action=reinstall;; 8) action=caddy;; 9) action=self-update;; 10) action=uninstall;; 11) action=uninstall-script;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
     esac
     if /bin/bash "$SELF" "$action" "${arguments[@]}"; then
@@ -1299,7 +1747,7 @@ main() {
   fi
   while (($#)); do
     case "$1" in
-      install|update|reinstall|uninstall|status|logs|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network) ACTION=$1; shift;;
+      install|update|reinstall|uninstall|status|logs|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network|caddy|caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates|caddy-token) ACTION=$1; shift;;
       --yes) ACCEPT=1; shift;;
       --domain|--prefix|--zone|--channel|--cf-token-file)
         [[ $# -ge 2 ]] || die "缺少参数：$1"
@@ -1310,7 +1758,11 @@ main() {
   done
   [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
   if [[ -z $ACTION ]]; then open_installed_menu; return; fi
-  case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  case "$ACTION" in caddy-reload|caddy-restart|caddy-token)
+    caddy_require_install write; caddy_require_idle; caddy_token_pending_guard; caddy_lock_cf
+    caddy_refresh_runtime || die '后台程序更新失败，未修改 Caddy。';;
+  esac
   if [[ $ACTION == install && ! -f $ROOT/state/progress.json ]]; then
     printf '\033[1;31m仅限全新环境：启用 UFW、禁用 IPv6；请用 IPv4 SSH。\033[0m\n'
     if [[ $ACCEPT == 0 ]]; then confirm '开始安装？' || return 0; fi
@@ -1322,8 +1774,11 @@ main() {
     reinstall) reinstall_stack;;
     self-update) self_update;; rollback) rollback_stack;;
     uninstall-script) uninstall_script;;
-    status) load_state; dc ps; ufw status;; logs) load_state; dc logs --tail 80 caddy mmwx;;
+    status) load_state; dc ps; ufw status;; logs) load_state; caddy_redacted_command dc logs --tail 80 caddy mmwx;;
     resume) resume_task;;
+    caddy) caddy_menu;;
+    caddy-token) replace_caddy_token;;
+    caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates) caddy_action "${ACTION#caddy-}";;
   esac
 }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
