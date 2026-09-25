@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.13
+SCRIPT_VERSION=0.3.0
 SCRIPT_UPDATE_CHECKED=0 SCRIPT_UPDATE_VERSION=''
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
@@ -475,8 +475,8 @@ build_caddy() {
   asset="caddy-linux-$architecture.gz"
   builddir=$(mktemp -d)
   info '下载预编译的 Caddy + Cloudflare 模块（服务器无需编译）……'
-  run_step '下载 Caddy DNS 模块' get "https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.1.0-rc.1/$asset" -o "$builddir/$asset" || { rm -rf "$builddir"; die 'Caddy 下载失败，详情见任务日志。'; }
-  run_step '下载 Caddy 校验文件' get 'https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.1.0-rc.1/SHA256SUMS' -o "$builddir/SHA256SUMS" || { rm -rf "$builddir"; die 'Caddy 校验文件下载失败。'; }
+  run_step '下载 Caddy DNS 模块' get "https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.3.0/$asset" -o "$builddir/$asset" || { rm -rf "$builddir"; die 'Caddy 下载失败，详情见任务日志。'; }
+  run_step '下载 Caddy 校验文件' get 'https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.3.0/SHA256SUMS' -o "$builddir/SHA256SUMS" || { rm -rf "$builddir"; die 'Caddy 校验文件下载失败。'; }
   (cd "$builddir"; grep -E "^[a-f0-9]{64}  $asset$" SHA256SUMS | sha256sum --status -c -) || { rm -rf "$builddir"; die 'Caddy 下载校验失败。'; }
   run_step '解压 Caddy DNS 模块' gzip -dk "$builddir/$asset" || { rm -rf "$builddir"; die 'Caddy 解压失败，详情见任务日志。'; }
   mv "$builddir/${asset%.gz}" "$builddir/caddy"
