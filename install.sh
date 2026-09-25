@@ -303,7 +303,8 @@ dns_check() {
     fi
     ZONE_NAME=$(jq -r .name <<<"$chosen")
     info "主域名：$ZONE_NAME"
-    [[ -n $PREFIX ]] || PREFIX=$(ask '子域名前缀（如 cs）：')
+    [[ -n $PREFIX ]] || PREFIX=$(ask '子域名前缀 [mmwx]：')
+    PREFIX=${PREFIX:-mmwx}
     DOMAIN=$(join_domain "$PREFIX" "$ZONE_NAME") || { rm -f "$headers"; die '前缀只用小写字母、数字或连字符，如 cs。'; }
   fi
   valid_domain "$DOMAIN" || { rm -f "$headers"; die '域名格式不正确。'; }
@@ -724,7 +725,7 @@ uninstall_stack() {
 usage() {
   cat <<'EOF'
 用法：mmwx（管理菜单）或 sudo bash install.sh [install|update|uninstall|status|logs|resume|check]
-  --prefix panel             子域名前缀
+  --prefix mmwx              子域名前缀（交互输入回车默认 mmwx）
   --zone example.com         Token 授权多个主域名时指定主域名
   --domain panel.example.com  兼容完整域名参数
   --channel stable|beta       安装或更新的发布通道

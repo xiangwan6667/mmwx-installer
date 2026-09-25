@@ -12,7 +12,7 @@
 2. 将主域名托管到 [Cloudflare](https://dash.cloudflare.com/)：添加域名，并在域名注册商处将 NS 改成 Cloudflare 分配的两条地址。等待区域状态为 **Active**。仅在 Cloudflare 添加站点而不修改 NS，不能签发证书。
 3. 在该区域的 SSL/TLS → 概述选择 **完全（严格）/ Full (strict)**。
 4. 打开 [API Token 页面](https://dash.cloudflare.com/profile/api-tokens)，选择创建令牌 → 自定义令牌。权限添加 `Zone / DNS / Edit` 与 `Zone / Zone / Read`；区域资源只选托管的主域名。不要使用 Global API Key。Token 用于签发和自动续期，安装完成后仍需保留其有效性。
-5. 想好子域名前缀，例如 `panel`。脚本读取 Token 授权的主域名；只有一个时自动选择，多个时显示编号。通过 API 创建 `panel.example.com` 的 A 记录并开启小黄云。同名记录完全匹配时复用；遇到冲突时停止，不覆盖现有记录。
+5. 子域名前缀默认为 `mmwx`，回车直接使用，也可输入其他前缀。脚本读取 Token 授权的主域名；只有一个时自动选择，多个时显示编号。默认通过 API 创建 `mmwx.example.com` 的 A 记录并开启小黄云。同名记录完全匹配时复用；遇到冲突时停止，不覆盖现有记录。
 6. 云厂商安全组也要允许当前 SSH 端口，以及 Cloudflare 回源访问 TCP 80/443。本脚本只能管理服务器内部防火墙。
 
 ## 运行
@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/xiangwan6667/mmwx-installer/main/in
 sudo bash mmwx-install.sh
 ```
 
-按菜单选择安装，输入 Token、子域名前缀（如 `panel`）并选择正式版或 Beta。Token 输入不会显示，确认只需 `y` / `n`，回车默认为否。脚本实时查询 GitHub Releases；API 限流或不可用时自动读取官方发布网页，仍使用具体版本号，镜像下载后固定 digest。
+按菜单选择安装，输入 Token、子域名前缀（回车使用 `mmwx`）并选择正式版或 Beta。Token 输入不会显示，确认只需 `y` / `n`，确认时回车默认为否。脚本实时查询 GitHub Releases；API 限流或不可用时自动读取官方发布网页，仍使用具体版本号，镜像下载后固定 digest。
 
 开始安装后会注册管理命令，以后直接运行（root 无需 `sudo`）：
 
