@@ -52,4 +52,8 @@ assert_access
 install_units
 systemctl restart docker
 assert_access
+printf '{"stage":1}' > "$ROOT/progress.json"
+# A stopped/interrupted legacy task must not leave the daily refresh timer stopped.
+ensure_layout
+systemctl is-active --quiet mmwx-cf-sync.timer
 echo 'PASS: only permitted sources reach Docker through ipset, including after UFW reload and Docker restart'

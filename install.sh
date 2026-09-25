@@ -88,6 +88,7 @@ ensure_layout() {
       apply_firewall
       dc up -d --wait --wait-timeout 300
     fi
+    if [[ -f /etc/systemd/system/mmwx-cf-sync.timer ]]; then systemctl start mmwx-cf-sync.timer; fi
     mv "$ROOT/.layout-migration" "$ROOT/state/layout-v2"
     info '目录迁移完成。'
   fi

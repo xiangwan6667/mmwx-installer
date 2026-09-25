@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source ./install.sh
+eval "$(declare -f remove_services | sed '1s/remove_services/real_remove_services/')"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 ROOT=$tmp
 mkdir -p "$ROOT/config" "$ROOT/state"
@@ -23,4 +24,13 @@ CHOICE=2 ANSWER=y
 uninstall_stack >/dev/null
 [[ $(cat "$ROOT/calls") == $'removed\npurged' ]]
 grep -q '永久删除' "$ROOT/prompts"
+systemctl() { case "$1" in show) echo not-found;; disable) return 42;; *) :;; esac; }
+iptables() { return 1; }
+ipset() { return 1; }
+remove_legacy_cf_rules() { :; }
+# Keep unit-file removal inside this test's filesystem boundary.
+# shellcheck disable=SC2329
+rm() { :; }
+real_remove_services
+unset -f rm
 echo 'PASS: uninstall defaults to retention; full deletion requires confirmation'
