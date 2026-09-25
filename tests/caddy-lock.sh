@@ -20,9 +20,10 @@ eval "$(declare -f caddy_refresh_runtime | sed 's|/usr/local/lib/mmwx-installer|
 eval "$(declare -f sync_cf | sed 's|/run/mmwx-cf.lock|$tmp/cf.lock|g')"
 flock() { printf '%s\n' "$*" >> "$tmp/locks"; [[ ${BUSY:-} != "${*: -1}" ]]; }
 caddy_action() { printf '%s\n' "$1" >> "$tmp/actions"; }
-for action in caddy-reload caddy-restart caddy-token; do
+for action in caddy-reload caddy-restart caddy-token caddy-domain; do
   (
     replace_caddy_token() { echo token >> "$tmp/actions"; }
+    change_caddy_domain() { echo domain >> "$tmp/actions"; }
     : > "$tmp/locks"; : > "$tmp/actions"
     main "$action"
     [[ $(cat "$tmp/locks") == $'-n 7\n-w 180 8' ]]
@@ -35,6 +36,10 @@ for action in caddy-reload caddy-restart caddy-token; do
     [[ ! -s $tmp/actions ]]
   done
 done
+(
+  change_caddy_domain() { [[ $CADDY_DOMAIN_TARGET == new.example.com && $DOMAIN == mmwx.example.com ]]; }
+  main caddy-domain --domain new.example.com
+)
 # A staged token operation blocks conflicting work, including the old timer.
 mkdir "$ROOT/state/caddy-token-change"
 for operation in install_stack update_stack reinstall_stack rollback_stack uninstall_stack; do
@@ -62,4 +67,16 @@ mkdir "$ROOT/state/caddy-token-change"
 recover_caddy_token() { echo token-recovered >> "$tmp/actions"; }
 resume_task > "$tmp/output"
 [[ $(cat "$tmp/actions") == token-recovered ]]
+rm -r "$ROOT/state/caddy-token-change"
+mkdir "$ROOT/state/caddy-domain-change"
+for operation in install_stack update_stack reinstall_stack rollback_stack uninstall_stack replace_caddy_token; do
+  if ("$operation") > "$tmp/output" 2>&1; then echo "Pending domain allowed $operation"; exit 1; fi
+done
+: > "$tmp/actions"
+sync_cf > "$tmp/output"
+[[ ! -s $tmp/actions ]]
+if (main caddy-reload) > "$tmp/output" 2>&1; then echo 'Pending domain allowed reload'; exit 1; fi
+recover_caddy_domain() { echo domain-recovered >> "$tmp/actions"; }
+resume_task > "$tmp/output"
+[[ $(cat "$tmp/actions") == domain-recovered ]]
 echo 'PASS: ordered maintenance/CF locks, pending-task guards, legacy isolation, runtime refresh and token-only resume'

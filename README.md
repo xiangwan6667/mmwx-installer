@@ -14,7 +14,7 @@
 
 </div>
 
-通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.12**。
+通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.13**。
 
 ## 功能
 
@@ -121,6 +121,7 @@ mmwx logs          # 最近 80 行服务日志
 | 4 | 重启 Caddy |
 | 5 | 源站、Cloudflare 边缘证书与公网 HTTPS 状态 |
 | 6 | 替换 Cloudflare Token |
+| 7 | 变更域名 |
 
 Token 可隐藏输入，也可使用 root 所有、权限为 `600` 的文件：
 
@@ -133,6 +134,20 @@ mmwx caddy-token --cf-token-file /root/cloudflare.token
 验证失败不替换凭据；应用失败自动恢复旧配置。断开终端或清理失败时，选择**主菜单 5**恢复任务。待恢复期间暂停 CF 网段定时刷新，并阻止冲突维护操作。Token 不显示在命令参数、终端及管理日志中。
 
 证书检查分别连接本机源站和公网域名，显示签发者、到期时间及剩余天数。公网故障单独报告，不作为 Token 失效的判断依据。旧目录安装需先通过主菜单 5 完成迁移。
+
+#### 变更域名
+
+选择 Caddy 菜单 **7**，或运行：
+
+```bash
+mmwx caddy-domain
+```
+
+选择当前 Token 授权的主域名，输入子域名前缀（回车使用 `mmwx`），再以 `y/n` 确认。新主域名须已托管至 Cloudflare 并处于 Active 状态；当前 Token 需同时有新旧区域的读取和 DNS 编辑权限。
+
+脚本创建或复用匹配的代理 A 记录，为新域名申请证书，并检查源站与公网 HTTPS。期间保留旧域名，仅重载 Caddy；容器、数据库、业务文件、Token 和已有证书均保留。
+
+切换成功后自动删除旧域名中带安装器标记、仍指向本机且未被修改的代理 A 记录。手工创建或已修改的记录保留。新域名验证失败时恢复旧配置；清理旧解析失败时保留新域名服务，通过主菜单 **5** 重试。域名变更过程中断后也使用菜单 **5** 恢复。
 
 ## 数据与恢复
 

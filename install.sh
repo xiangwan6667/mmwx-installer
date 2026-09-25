@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.12
+SCRIPT_VERSION=0.2.13
 SCRIPT_UPDATE_CHECKED=0 SCRIPT_UPDATE_VERSION=''
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
@@ -775,6 +775,7 @@ remove_legacy_cf_rules() {
 sync_cf() (
   exec 8>/run/mmwx-cf.lock; flock -w 180 8 || { info 'CF 规则正在更新，请稍后重试。'; return 1; }
   if [[ -e $ROOT/state/caddy-token-change ]]; then info 'Token 替换待恢复，本次 CF 同步跳过。'; return 0; fi
+  if [[ -e $ROOT/state/caddy-domain-change ]]; then info '域名变更待恢复，本次 CF 同步跳过。'; return 0; fi
   local state=$ROOT/state config=$ROOT/config
   if [[ ! -f $state/state.json && -f $ROOT/state.json ]]; then state=$ROOT; config=$ROOT; fi
   local old=$state/cloudflare-v4.txt new=$state/cloudflare-v4.new
@@ -1897,10 +1898,11 @@ caddy_validate_config() {
   caddy_step '校验 Caddy 配置' dc exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 }
 caddy_ready() {
-  python3 - "$ROOT" "$DOMAIN" <<'PY'
+  python3 - "$ROOT" "$DOMAIN" "${1:-60}" <<'PY'
 import socket, ssl, subprocess, sys, time
-root, domain = sys.argv[1:]
-deadline = time.monotonic() + 60
+root, domain, wait_seconds = sys.argv[1:]
+wait_seconds = int(wait_seconds)
+deadline = time.monotonic() + wait_seconds
 command = ["docker", "compose", "--project-name", "mmwx-installer",
            "--project-directory", root + "/config", "-f", root + "/config/compose.yaml",
            "ps", "--status", "running", "-q", "caddy"]
@@ -1929,7 +1931,7 @@ while time.monotonic() < deadline:
         reason = "Caddy 状态或本机源站 TLS 连接未就绪"
     remaining = deadline - time.monotonic()
     if remaining > 0: time.sleep(min(1, remaining))
-print("Caddy 在 60 秒内未就绪：" + reason + "。", file=sys.stderr)
+print(f"Caddy 在 {wait_seconds} 秒内未就绪：" + reason + "。", file=sys.stderr)
 sys.exit(1)
 PY
 }
@@ -2049,11 +2051,11 @@ caddy_menu() {
   [[ -z $TOKEN_FILE ]] || arguments+=(--cf-token-file "$TOKEN_FILE")
   while true; do
     section 'Caddy 管理'
-    printf '    1  查看运行状态\n    2  查看最近 80 行日志\n    3  校验并重载配置\n    4  重启 Caddy\n    5  查看源站 / Cloudflare 边缘证书\n    6  更换 Cloudflare Token\n\n    0  返回\n\n'
+    printf '    1  查看运行状态\n    2  查看最近 80 行日志\n    3  校验并重载配置\n    4  重启 Caddy\n    5  查看源站 / Cloudflare 边缘证书\n    6  更换 Cloudflare Token\n    7  变更域名\n\n    0  返回\n\n'
     choice=$(ask '选择：')
     case "$choice" in
       1) action=caddy-status;; 2) action=caddy-logs;; 3) action=caddy-reload;;
-      4) action=caddy-restart;; 5) action=caddy-certificates;; 6) action=caddy-token;;
+      4) action=caddy-restart;; 5) action=caddy-certificates;; 6) action=caddy-token;; 7) action=caddy-domain;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
     esac
     if /bin/bash "$SELF" "$action" "${arguments[@]}"; then :; else info '操作未完成，可从菜单重试。'; fi
@@ -2077,6 +2079,8 @@ self-update 从最新正式 Release 更新管理脚本，并校验 SHA-256。
 打开管理菜单时自动检测脚本新版本；检测失败不影响使用，菜单 9 手动更新。
 trace 查看最近任务及失败原因；trace-follow 实时追踪；log-menu 打开日志与诊断。
 caddy 打开网关管理菜单；caddy-token --cf-token-file /root/token 替换 Token。
+caddy-domain 选择新主域名及前缀；也可用 --zone example.com --prefix mmwx。
+新域名验证通过后自动删除脚本创建且仍指向本机的旧 A 记录；中断用菜单 5 恢复。
 caddy-status / caddy-logs / caddy-reload / caddy-restart / caddy-certificates 可直接执行。
 EOF
 }
@@ -2115,6 +2119,7 @@ caddy_refresh_runtime() {
 }
 caddy_token_pending_guard() {
   [[ ! -e $ROOT/state/caddy-token-change ]] || die 'Token 替换待恢复，请先选择菜单 5。'
+  [[ ! -e $ROOT/state/caddy-domain-change ]] || die '域名变更待恢复，请先选择菜单 5。'
 }
 caddy_token_file_check() {
   [[ -f $1 && ! -L $1 && $(stat -c %u "$1") == 0 && $(stat -c %a "$1") == 600 ]]
@@ -2301,7 +2306,274 @@ replace_caddy_token() (
   caddy_token_discard || die 'Token 已生效，暂存清理失败，请通过菜单 5 清理。'
   info 'Cloudflare Token 已替换，现有证书继续使用。'
 )
+caddy_domain_request() (
+  set +x
+  local method=$1 endpoint=$2 payload=$3 output=$4 dir=$ROOT/state/caddy-domain-change credential status
+  local -a args=()
+  caddy_token_file_check "$ROOT/config/cloudflare.token" || return 1
+  credential=$(cat "$ROOT/config/cloudflare.token") || return 1
+  [[ $credential =~ ^[A-Za-z0-9_.-]+$ && ${#credential} -ge 20 && ${#credential} -le 256 ]] || return 1
+  printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$credential" > "$dir/request.headers" || return 1
+  unset credential
+  [[ -z $payload ]] || args+=(--data-binary "@$payload")
+  status=$(curl -q --proto '=https' --tlsv1.2 --silent --show-error --retry 0 \
+    --connect-timeout 10 --max-time 30 --request "$method" --header "@$dir/request.headers" \
+    "${args[@]}" --output "$output" --write-out '%{http_code}' \
+    "https://api.cloudflare.com/client/v4$endpoint" 2> "$dir/request.error") || return 1
+  [[ $status == 2?? ]] && jq -e '.success==true' "$output" >/dev/null 2>&1
+)
+caddy_domain_journal() {
+  local dir=$ROOT/state/caddy-domain-change
+  jq "$@" "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json"
+}
+caddy_domain_records() {
+  local zone=$1 name=$2 output=$3
+  [[ $zone =~ ^[A-Za-z0-9]+$ ]] && valid_domain "$name" || return 1
+  caddy_domain_request GET "/zones/$zone/dns_records?name=$name&per_page=100" '' "$output" || return 1
+  jq -e --arg name "$name" '(.result|type)=="array" and
+    ((.result_info.total_pages // 1)|type)=="number" and
+    (.result_info.total_pages // 1)>=0 and (.result_info.total_pages // 1)<=1 and
+    all(.result[]; .name==$name and (.id|type)=="string" and (.id|test("^[A-Za-z0-9]+$")))' "$output" >/dev/null
+}
+caddy_domain_local_ipv4() {
+  ip -j -4 address show scope global | python3 -c 'import json,sys,ipaddress
+a=[x["local"] for i in json.load(sys.stdin) for x in i.get("addr_info",[]) if ipaddress.ip_address(x["local"]).is_global]
+assert len(a)==1 and ipaddress.ip_address(a[0]).version==4
+print(a[0])'
+}
+caddy_domain_plan() {
+  local target=${1:-} dir=$ROOT/state/caddy-domain-change page=1 pages zone chosen count pick old oldzone newzone ipv4
+  old=$(jq -er .old_domain "$dir/journal.json") || return 1
+  # shellcheck disable=SC2016
+  if [[ $target == "$old" ]]; then caddy_domain_journal --arg new "$target" '.new_domain=$new'; return; fi
+  printf '[]' > "$dir/zones.json"
+  while true; do
+    caddy_domain_request GET "/zones?status=active&per_page=50&page=$page" '' "$dir/response.json" || return 1
+    jq -e '(.result|type)=="array" and all(.result[]; (.id|type)=="string" and (.id|test("^[A-Za-z0-9]+$")) and (.name|type)=="string")' "$dir/response.json" >/dev/null || return 1
+    jq -s '.[0] + [.[1].result[] | select(.status=="active")]' "$dir/zones.json" "$dir/response.json" > "$dir/zones.tmp" && mv "$dir/zones.tmp" "$dir/zones.json" || return 1
+    pages=$(jq -r '.result_info.total_pages // 1' "$dir/response.json") || return 1
+    [[ $pages =~ ^[1-9][0-9]*$ && ${#pages} -le 3 && $pages -le 100 ]] || return 1
+    ((page < pages)) || break
+    page=$((page+1))
+  done
+  if [[ -z $target ]]; then
+    jq --arg zone "${ZONE_NAME:-}" '[.[]|select($zone=="" or .name==$zone)] | unique_by(.id)' "$dir/zones.json" > "$dir/choices.json" || return 1
+    count=$(jq length "$dir/choices.json") || return 1
+    ((count>0)) || { info '请先将主域名托管到 Cloudflare，等待 Active 并授权当前 Token。'; return 1; }
+    pick=1
+    if ((count>1)); then
+      jq -r 'to_entries[] | "  \(.key+1)  \(.value.name)"' "$dir/choices.json"
+      pick=$(ask '选择主域名：') || return 1
+      [[ $pick =~ ^[1-9][0-9]*$ && ${#pick} -le 4 && $pick -le $count ]] || return 1
+    fi
+    chosen=$(jq -r --argjson index "$((pick-1))" '.[$index].name' "$dir/choices.json") || return 1
+    [[ -n $PREFIX ]] || PREFIX=$(ask '子域名前缀 [mmwx]：') || return 1
+    target=$(join_domain "${PREFIX:-mmwx}" "$chosen") || return 1
+  fi
+  valid_domain "$target" || return 1
+  # shellcheck disable=SC2016
+  if [[ $target == "$old" ]]; then caddy_domain_journal --arg new "$target" '.new_domain=$new'; return; fi
+  for zone in "$old" "$target"; do
+    chosen=$(jq -r --arg domain "$zone" '[.[] | . as $z | select($domain==$z.name or ($domain|endswith("."+$z.name)))] | sort_by(.name|length) | last | .id // ""' "$dir/zones.json") || return 1
+    [[ $chosen =~ ^[A-Za-z0-9]+$ ]] || { info "当前 Token 未授权 Active 区域：$zone"; return 1; }
+    if [[ $zone == "$old" ]]; then oldzone=$chosen; else newzone=$chosen; fi
+  done
+  ipv4=$(caddy_domain_local_ipv4) || return 1
+  caddy_domain_records "$newzone" "$target" "$dir/new-records.json" || return 1
+  dns_record_action "$ipv4" < "$dir/new-records.json" >/dev/null || { info '新域名已有冲突的 DNS 记录，未覆盖。'; return 1; }
+  caddy_domain_records "$oldzone" "$old" "$dir/old-records-response.json" || return 1
+  jq --arg ip "$ipv4" '[.result[] | select(.type=="A" and .content==$ip and .proxied==true and
+    ((.comment // "")=="mmwx-installer" or ((.comment // "")|test("^mmwx-installer-domain-[0-9a-f]{32}$"))))]' \
+    "$dir/old-records-response.json" > "$dir/old_records.json" || return 1
+  # jq variables are passed with --arg, not expanded by the shell.
+  # shellcheck disable=SC2016
+  caddy_domain_journal --arg domain "$target" --arg oldzone "$oldzone" --arg newzone "$newzone" --arg ip "$ipv4" \
+    '.new_domain=$domain | .old_zone=$oldzone | .new_zone=$newzone | .ipv4=$ip'
+}
+caddy_domain_ensure_dns() {
+  local dir=$ROOT/state/caddy-domain-change zone name ipv4 comment operation
+  zone=$(jq -er .new_zone "$dir/journal.json") || return 1
+  name=$(jq -er .new_domain "$dir/journal.json") || return 1
+  ipv4=$(jq -er .ipv4 "$dir/journal.json") || return 1
+  comment=$(jq -er .new_comment "$dir/journal.json") || return 1
+  caddy_domain_records "$zone" "$name" "$dir/new-records.json" || return 1
+  operation=$(dns_record_action "$ipv4" < "$dir/new-records.json") || return 1
+  [[ $operation != keep ]] || return 0
+  # A timed-out POST is never repeated. Reconcile or recover its unique marker.
+  [[ $(jq -r .create_started "$dir/journal.json") == false ]] || return 1
+  caddy_domain_journal '.create_started=true' || return 1
+  jq -n --arg domain "$name" --arg ip "$ipv4" --arg comment "$comment" \
+    '{type:"A",name:$domain,content:$ip,proxied:true,ttl:1,comment:$comment}' > "$dir/create.json" || return 1
+  caddy_domain_request POST "/zones/$zone/dns_records" "$dir/create.json" "$dir/created.json" || true
+  caddy_domain_records "$zone" "$name" "$dir/new-records.json" || return 1
+  jq -e --arg ip "$ipv4" --arg comment "$comment" '(.result|length)==1 and
+    all(.result[]; .type=="A" and .content==$ip and .proxied==true and .comment==$comment)' "$dir/new-records.json" >/dev/null
+}
+caddy_domain_cleanup_dns() {
+  local which=$1 dir=$ROOT/state/caddy-domain-change zone name ipv4 comment id
+  case "$which" in
+    old) zone=$(jq -er .old_zone "$dir/journal.json") && name=$(jq -er .old_domain "$dir/journal.json") || return 1;;
+    new)
+      [[ $(jq -r .create_started "$dir/journal.json") == true ]] || return 0
+      zone=$(jq -er .new_zone "$dir/journal.json") && name=$(jq -er .new_domain "$dir/journal.json") || return 1;;
+    *) return 1;;
+  esac
+  caddy_domain_records "$zone" "$name" "$dir/cleanup.json" || return 1
+  if [[ $which == old ]]; then
+    jq --slurpfile saved "$dir/old_records.json" '[.result[] as $r | $saved[0][] |
+      select(.id==$r.id and .name==$r.name and .type==$r.type and .content==$r.content and
+        .proxied==$r.proxied and .comment==$r.comment and .ttl==$r.ttl)]' "$dir/cleanup.json" > "$dir/delete-records.json" || return 1
+  else
+    ipv4=$(jq -er .ipv4 "$dir/journal.json") && comment=$(jq -er .new_comment "$dir/journal.json") || return 1
+    jq --arg ip "$ipv4" --arg comment "$comment" '[.result[] | select(.type=="A" and .content==$ip and .proxied==true and .comment==$comment)]' \
+      "$dir/cleanup.json" > "$dir/delete-records.json" || return 1
+  fi
+  jq -r '.[].id' "$dir/delete-records.json" > "$dir/delete-ids" || return 1
+  while IFS= read -r id; do
+    [[ $id =~ ^[A-Za-z0-9]+$ ]] || return 1
+    # Re-read immediately before deletion; preserve records edited since planning.
+    caddy_domain_records "$zone" "$name" "$dir/cleanup.json" || return 1
+    if ! jq -e --arg id "$id" --slurpfile saved "$dir/delete-records.json" \
+      '[.result[] as $r | $saved[0][] | select(.id==$id and .id==$r.id and .name==$r.name and .type==$r.type and .content==$r.content and .proxied==$r.proxied and .comment==$r.comment and .ttl==$r.ttl)] | length==1' "$dir/cleanup.json" >/dev/null; then
+      info 'DNS 记录已变化或移除，保留现有配置。'; continue
+    fi
+    caddy_domain_request DELETE "/zones/$zone/dns_records/$id" '' "$dir/deleted.json" || true
+    caddy_domain_records "$zone" "$name" "$dir/cleanup.json" || return 1
+    jq -e --arg id "$id" 'all(.result[]; .id!=$id)' "$dir/cleanup.json" >/dev/null || return 1
+  done < "$dir/delete-ids"
+}
+
+caddy_domain_phase() {
+  local dir=$ROOT/state/caddy-domain-change
+  jq --arg phase "$1" '.phase=$phase' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json"
+}
+caddy_domain_stage() (
+  local staging file random
+  caddy_token_pending_guard
+  staging=$(mktemp -d "$ROOT/state/.caddy-domain-XXXXXX") || return 1
+  trap 'rm -rf -- "$staging"' EXIT
+  chmod 700 "$staging" || return 1
+  cp "$ROOT/config/Caddyfile" "$staging/old.Caddyfile" || return 1
+  for file in state progress; do
+    if [[ -e $ROOT/state/$file.json ]]; then
+      [[ -f $ROOT/state/$file.json && ! -L $ROOT/state/$file.json ]] || return 1
+      cp "$ROOT/state/$file.json" "$staging/old.$file.json" || return 1
+    fi
+  done
+  random=$(openssl rand -hex 16) || return 1
+  jq -n --arg old "$DOMAIN" --arg comment "mmwx-installer-domain-$random" \
+    '{phase:"preparing",old_domain:$old,new_domain:"",create_started:false,new_comment:$comment}' > "$staging/journal.json" || return 1
+  chmod 600 "$staging"/* || return 1
+  mv "$staging" "$ROOT/state/caddy-domain-change"
+)
+caddy_domain_discard() { rm -rf -- "$ROOT/state/caddy-domain-change"; }
+caddy_domain_reload() {
+  caddy_validate_config && caddy_step '重载 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+}
+caddy_domain_verify() {
+  caddy_ready 300 || return 1
+  # Public DNS may take a little longer to reach the new Cloudflare record.
+  local attempt
+  for ((attempt=0; attempt<6; attempt++)); do
+    if curl -q --proto '=https' --proto-redir '=https' --noproxy '*' \
+      -fsS --connect-timeout 3 --max-time 10 "https://$DOMAIN/" -o /dev/null; then return 0; fi
+    sleep 2
+  done
+  printf '新域名的公网 HTTPS 未通过，请检查 Cloudflare SSL 模式、DNS 和访问规则。\n' >&2
+  return 1
+}
+caddy_domain_write_state() {
+  local file dir=$ROOT/state/caddy-domain-change
+  for file in state progress; do
+    [[ -f $dir/old.$file.json ]] || continue
+    jq --arg domain "$DOMAIN" '.domain=$domain' "$dir/old.$file.json" > "$ROOT/state/$file.json.tmp" &&
+      mv "$ROOT/state/$file.json.tmp" "$ROOT/state/$file.json" || return 1
+  done
+}
+recover_caddy_domain() (
+  set +x
+  local dir=$ROOT/state/caddy-domain-change phase file old new
+  caddy_require_install write
+  caddy_require_idle
+  [[ ! -e $ROOT/state/caddy-token-change ]] || die '存在冲突的 Token 任务，请先检查恢复记录。'
+  [[ -d $dir && ! -L $dir && -f $dir/journal.json && ! -L $dir/journal.json ]] || die '域名恢复记录缺失或异常。'
+  phase=$(jq -er .phase "$dir/journal.json") || die '域名恢复阶段无效。'
+  old=$(jq -er .old_domain "$dir/journal.json") || return 1
+  new=$(jq -r .new_domain "$dir/journal.json") || return 1
+  valid_domain "$old" && [[ $DOMAIN == "$old" || $DOMAIN == "$new" ]] || die '域名恢复记录不匹配。'
+  case "$phase" in
+    committed)
+      [[ $DOMAIN == "$new" ]] || die '已提交域名与安装记录不匹配。'
+      caddy_domain_cleanup_dns old || die '旧 DNS 清理未完成，新域名保持服务；请重试菜单 5。';;
+    preparing) ;;
+    dns|restored) caddy_domain_cleanup_dns new || die '新 DNS 清理未完成，请重试菜单 5。';;
+    applying|rollback)
+      caddy_domain_phase rollback || return 1
+      [[ -f $dir/old.Caddyfile && ! -L $dir/old.Caddyfile ]] || die '旧 Caddy 配置缺失。'
+      DOMAIN=$old
+      # Preserve the bind-mounted inode while restoring the exact old config.
+      cat "$dir/old.Caddyfile" > "$ROOT/config/Caddyfile" || return 1
+      for file in state progress; do
+        [[ -f $dir/old.$file.json ]] || continue
+        [[ ! -L $dir/old.$file.json ]] || return 1
+        cp "$dir/old.$file.json" "$ROOT/state/$file.json.tmp" && mv "$ROOT/state/$file.json.tmp" "$ROOT/state/$file.json" || return 1
+      done
+      if ! caddy_domain_reload || ! caddy_ready; then die '旧域名恢复未完成，记录保留；请重试菜单 5。'; fi
+      caddy_domain_phase restored || return 1
+      caddy_domain_cleanup_dns new || die '旧域名已恢复，新 DNS 清理失败；请重试菜单 5。';;
+    *) die '未知域名恢复阶段，记录保留。';;
+  esac
+  caddy_domain_discard || return 1
+  info '域名任务已完成恢复。'
+)
+caddy_domain_apply() {
+  local dir=$ROOT/state/caddy-domain-change old
+  old=$(jq -er .old_domain "$dir/journal.json") || return 1
+  DOMAIN=$(jq -er .new_domain "$dir/journal.json") || return 1
+  valid_domain "$DOMAIN" || return 1
+  caddy_domain_phase applying || return 1
+  # Keep the old host working while the new certificate is issued.
+  render_caddy "$old, $DOMAIN" > "$dir/candidate.Caddyfile" || return 1
+  cat "$dir/candidate.Caddyfile" > "$ROOT/config/Caddyfile" || return 1
+  caddy_domain_reload || return 1
+  caddy_step '检查新域名证书与 HTTPS' caddy_domain_verify || return 1
+  render_caddy > "$dir/candidate.Caddyfile" || return 1
+  cat "$dir/candidate.Caddyfile" > "$ROOT/config/Caddyfile" || return 1
+  caddy_domain_reload && caddy_ready || return 1
+  caddy_domain_write_state && caddy_domain_phase committed
+}
+change_caddy_domain() (
+  set +x
+  local target=${1:-${CADDY_DOMAIN_TARGET:-}} dir=$ROOT/state/caddy-domain-change old new
+  caddy_require_install write
+  caddy_require_idle
+  caddy_token_pending_guard
+  old=$DOMAIN
+  caddy_domain_stage || die '无法保存域名恢复记录，未修改配置。'
+  if ! caddy_domain_plan "$target"; then caddy_domain_discard; die '无法准备域名变更，未修改 DNS 或配置。'; fi
+  new=$(jq -er .new_domain "$dir/journal.json") || return 1
+  if [[ $new == "$old" ]]; then caddy_domain_discard; info '域名未变化。'; return 0; fi
+  if ! confirm "域名：$old → $new，成功后清理脚本创建的旧解析？"; then caddy_domain_discard; return 0; fi
+  caddy_domain_phase dns || return 1
+  if ! caddy_domain_ensure_dns; then
+    recover_caddy_domain || die 'DNS 操作未完成，请用菜单 5 恢复。'
+    die '新 DNS 准备失败，旧域名保持不变。'
+  fi
+  if ! caddy_domain_apply; then
+    caddy_tls_diagnose '' || true
+    recover_caddy_domain || die '域名切换失败且恢复未完成，请用菜单 5 继续。'
+    die '域名切换失败，已恢复旧域名。'
+  fi
+  caddy_domain_cleanup_dns old || die '新域名已生效，旧 DNS 清理未完成；请用菜单 5 继续。'
+  caddy_domain_discard || die '新域名已生效，恢复记录清理失败。'
+  info "域名已变更：https://$new"
+)
 resume_task() {
+  if [[ -e $ROOT/state/caddy-domain-change ]]; then
+    caddy_lock_cf
+    caddy_refresh_runtime || die '后台程序更新失败，请重试。'
+    recover_caddy_domain; return
+  fi
   if [[ -e $ROOT/state/caddy-token-change ]]; then
     caddy_lock_cf
     caddy_refresh_runtime || die '后台程序更新失败，请重试。'
@@ -2335,7 +2607,8 @@ menu_header() {
     version=$(jq -r '.version // "未知"' "$state" 2>/dev/null) || version='未知'
     domain=$(jq -r '.domain // ""' "$state" 2>/dev/null) || domain=''
   fi
-  if [[ -e $ROOT/state/caddy-token-change ]]; then task='Token 替换待恢复';
+  if [[ -e $ROOT/state/caddy-domain-change ]]; then task='域名变更待恢复';
+  elif [[ -e $ROOT/state/caddy-token-change ]]; then task='Token 替换待恢复';
   elif [[ -f $ROOT/state/reinstall.json ]]; then task='镜像重装待继续';
   elif [[ -f $ROOT/state/image-rollback.json ]]; then task='版本切换待继续';
   elif [[ -f $ROOT/state/update.json ]]; then task='更新恢复待继续';
@@ -2381,7 +2654,7 @@ main() {
   fi
   while (($#)); do
     case "$1" in
-      install|update|reinstall|uninstall|status|logs|log-menu|trace|trace-follow|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network|caddy|caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates|caddy-token) ACTION=$1; shift;;
+      install|update|reinstall|uninstall|status|logs|log-menu|trace|trace-follow|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network|caddy|caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates|caddy-token|caddy-domain) ACTION=$1; shift;;
       --yes) ACCEPT=1; shift;;
       --domain|--prefix|--zone|--channel|--cf-token-file)
         [[ $# -ge 2 ]] || die "缺少参数：$1"
@@ -2390,18 +2663,19 @@ main() {
       -h|--help) usage; return;; *) die "未知参数：$1";;
     esac
   done
+  CADDY_DOMAIN_TARGET=$DOMAIN
   [[ $EUID == 0 ]] || die '请使用 root 运行。'
   if [[ -z $ACTION ]]; then open_installed_menu; return; fi
-  case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
-  case "$ACTION" in install|update|reinstall|uninstall|resume|rollback|self-update|caddy-reload|caddy-restart|caddy-token|check)
+  case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token|caddy-domain) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  case "$ACTION" in install|update|reinstall|uninstall|resume|rollback|self-update|caddy-reload|caddy-restart|caddy-token|caddy-domain|check)
     trace_start "$ACTION" || die '无法创建任务日志。';;
   esac
   if [[ -f $ROOT/state/docker-purge.json ]]; then
-    case "$ACTION" in install|update|reinstall|resume|rollback|caddy-reload|caddy-restart|caddy-token)
+    case "$ACTION" in install|update|reinstall|resume|rollback|caddy-reload|caddy-restart|caddy-token|caddy-domain)
       die '完全卸载尚未完成，请从菜单 10 继续。';;
     esac
   fi
-  case "$ACTION" in caddy-reload|caddy-restart|caddy-token)
+  case "$ACTION" in caddy-reload|caddy-restart|caddy-token|caddy-domain)
     caddy_require_install write; caddy_require_idle; caddy_token_pending_guard; caddy_lock_cf
     caddy_refresh_runtime || die '后台程序更新失败，未修改 Caddy。';;
   esac
@@ -2421,6 +2695,7 @@ main() {
     resume) resume_task;;
     caddy) caddy_menu;;
     caddy-token) replace_caddy_token;;
+    caddy-domain) change_caddy_domain;;
     caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates) caddy_action "${ACTION#caddy-}";;
   esac
 }

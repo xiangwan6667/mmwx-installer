@@ -20,6 +20,7 @@ jobs:
       - run: sudo bash tests/task-trace.sh && sudo bash tests/caddy-build.sh && sudo bash tests/certificate-diagnostics.sh
       - run: sudo bash tests/reinstall.sh && sudo bash tests/update-isolation.sh
       - run: sudo bash tests/caddy-management.sh && sudo bash tests/caddy-token.sh && sudo bash tests/caddy-lock.sh
+      - run: sudo bash tests/caddy-domain.sh && sudo bash tests/caddy-domain-dns.sh
   runtime:
     runs-on: ubuntu-latest
     timeout-minutes: 15

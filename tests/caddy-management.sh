@@ -77,10 +77,10 @@ grep -Rq '\[REDACTED\]' "$ROOT/state/logs"
 #!/usr/bin/env bash
 printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$(dirname "$0")/menu-calls"
 CHILD
-  printf '1\n2\n3\n4\n5\n6\n0\n' > "$tmp/menu-answers"
+  printf '1\n2\n3\n4\n5\n6\n7\n0\n' > "$tmp/menu-answers"
   ask() { local answer; IFS= read -r answer < "$tmp/menu-answers"; tail -n +2 "$tmp/menu-answers" > "$tmp/menu-next"; mv "$tmp/menu-next" "$tmp/menu-answers"; printf '%s' "$answer"; }
   caddy_menu > "$tmp/menu-output"
-  printf '%s|--cf-token-file|%s\n' caddy-status "$TOKEN_FILE" caddy-logs "$TOKEN_FILE" caddy-reload "$TOKEN_FILE" caddy-restart "$TOKEN_FILE" caddy-certificates "$TOKEN_FILE" caddy-token "$TOKEN_FILE" > "$tmp/expected-menu"
+  printf '%s|--cf-token-file|%s\n' caddy-status "$TOKEN_FILE" caddy-logs "$TOKEN_FILE" caddy-reload "$TOKEN_FILE" caddy-restart "$TOKEN_FILE" caddy-certificates "$TOKEN_FILE" caddy-token "$TOKEN_FILE" caddy-domain "$TOKEN_FILE" > "$tmp/expected-menu"
   cmp "$tmp/menu-calls" "$tmp/expected-menu"
 )
 

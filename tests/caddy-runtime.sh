@@ -15,7 +15,7 @@ cleanup() {
   local code=$?
   if [[ $code != 0 && -f $ROOT/config/compose.yaml ]]; then
     compose ps >&2 || true
-    for output in "$ROOT/rotation-output" "$ROOT/rollback-output" "$ROOT/reload-output"; do
+    for output in "$ROOT/rotation-output" "$ROOT/rollback-output" "$ROOT/reload-output" "$ROOT/domain-success-output" "$ROOT/domain-rollback-output"; do
       if [[ -f $output ]]; then tail -n 30 "$output" | caddy_redact >&2 || true; fi
     done
   fi
@@ -186,3 +186,82 @@ assert_retained
 echo 'PASS: Token reaches the real Caddy environment; only the gateway is recreated and certificates/data persist'
 echo 'PASS: failed candidate restores both credentials and the Caddy environment without changing business containers'
 echo 'PASS: invalid reload retains the running gateway and verified origin TLS'
+
+# Real domain-change integration coverage: provider/public DNS boundaries only.
+new_domain=new.example.com
+third_domain=rollback.example.com
+domain_dns_log=$ROOT/domain-dns.log
+: > "$domain_dns_log"
+render_caddy() {
+  local hosts=${1:-$DOMAIN}
+  cat <<EOF
+{
+  auto_https disable_redirects
+}
+$hosts {
+  tls internal
+  respond "retained-gateway" 200
+}
+EOF
+}
+caddy_domain_plan() {
+  local target=${1:-$new_domain} dir=$ROOT/state/caddy-domain-change
+  [[ $target =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+  jq --arg new "$target" '.new_domain=$new' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json"
+}
+caddy_domain_ensure_dns() {
+  local dir=$ROOT/state/caddy-domain-change
+  printf 'ensure:%s\n' "$(jq -r .new_domain "$dir/journal.json")" >> "$domain_dns_log"
+  jq '.create_started=true' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json"
+}
+caddy_domain_cleanup_dns() { printf 'cleanup:%s\n' "$1" >> "$domain_dns_log"; }
+caddy_domain_verify() {
+  caddy_ready 30 || return 1
+  curl --silent --show-error --fail --noproxy '*' --connect-timeout 2 --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" | grep -qx retained-gateway
+}
+declare -A domain_before_id domain_before_started
+for service in caddy mmwx postgres; do
+  domain_before_id[$service]=$(compose ps -q "$service")
+  domain_before_started[$service]=$(docker inspect --format '{{.State.StartedAt}}' "${domain_before_id[$service]}")
+done
+cp "$ROOT/config/cloudflare.token" "$ROOT/domain-token"
+cp "$ROOT/config/caddy.env" "$ROOT/domain-caddy.env"
+sha256sum "$ROOT/config/compose.yaml" "$ROOT/config/app.env" "$ROOT/config/postgres.env" > "$ROOT/domain-files.sha256"
+find "$ROOT/certs/data" -type f \( -name '*.crt' -o -name '*.key' \) -exec sha256sum {} + | sort > "$ROOT/domain-certs.sha256"
+change_caddy_domain "$new_domain" > "$ROOT/domain-success-output" 2>&1
+DOMAIN=$new_domain
+[[ $(jq -r .domain "$ROOT/state/state.json") == "$new_domain" ]]
+[[ $(jq -r .domain "$ROOT/state/progress.json") == "$new_domain" ]]
+[[ ! -d $ROOT/state/caddy-domain-change ]]
+[[ $(cat "$domain_dns_log") == $'ensure:new.example.com\ncleanup:old' ]]
+for service in caddy mmwx postgres; do
+  id=$(compose ps -q "$service")
+  [[ $id == "${domain_before_id[$service]}" ]]
+  [[ $(docker inspect --format '{{.State.StartedAt}}' "$id") == "${domain_before_started[$service]}" ]]
+done
+[[ $(compose exec -T postgres psql -U mmwx -d mmwx -Atc 'SELECT value FROM caddy_rotation_test') == retained ]]
+for dir in /app/data /app/subscribes /app/rule_templates; do [[ $(compose exec -T mmwx cat "$dir/probe") == retained ]]; done
+for dir in /data /config; do [[ $(compose exec -T caddy cat "$dir/probe") == retained ]]; done
+[[ $(curl --silent --show-error --fail --noproxy '*' --resolve "$new_domain:443:127.0.0.1" "https://$new_domain/") == retained-gateway ]]
+cmp "$ROOT/domain-token" "$ROOT/config/cloudflare.token"
+cmp "$ROOT/domain-caddy.env" "$ROOT/config/caddy.env"
+sha256sum --check --status "$ROOT/domain-files.sha256"
+sha256sum --check --status "$ROOT/domain-certs.sha256"
+touch "$ROOT/fail-domain-ready"
+eval "$(declare -f caddy_ready | sed '1s/caddy_ready/caddy_ready_domain_runtime/')"
+caddy_ready() {
+  if [[ -f $ROOT/fail-domain-ready ]]; then rm -f "$ROOT/fail-domain-ready"; return 1; fi
+  caddy_ready_domain_runtime
+}
+if (change_caddy_domain "$third_domain") > "$ROOT/domain-rollback-output" 2>&1; then
+  echo 'Failed domain candidate was accepted'; exit 1
+fi
+[[ $(jq -r .domain "$ROOT/state/state.json") == "$new_domain" ]]
+[[ $(jq -r .domain "$ROOT/state/progress.json") == "$new_domain" ]]
+[[ ! -d $ROOT/state/caddy-domain-change ]]
+[[ $(compose ps -q caddy) == "${domain_before_id[caddy]}" ]]
+[[ $(curl --silent --show-error --fail --noproxy '*' --resolve "$new_domain:443:127.0.0.1" "https://$new_domain/") == retained-gateway ]]
+grep -q '^ensure:rollback.example.com$' "$domain_dns_log"
+grep -q '^cleanup:new$' "$domain_dns_log"
+echo 'PASS: domain switch keeps real Caddy, app, database, credentials, data and certificates while serving the new SNI'
+echo 'PASS: failed domain candidate restores the committed domain and cleans only the staged DNS record'
