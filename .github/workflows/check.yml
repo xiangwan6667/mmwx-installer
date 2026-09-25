@@ -8,11 +8,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y shellcheck jq
-      - run: bash -n install.sh && shellcheck install.sh tests/*.sh
+      - run: bash -n install.sh && bash -n bootstrap.sh && shellcheck install.sh bootstrap.sh tests/*.sh
       - run: sudo bash tests/test.sh && sudo bash tests/lifecycle.sh && sudo bash tests/resume.sh && sudo bash tests/update-resume.sh && sudo bash tests/dns.sh
       - run: sudo bash tests/firewall-migration.sh && sudo bash tests/uninstall.sh && sudo bash tests/management.sh
       - run: sudo bash tests/layout.sh
       - run: sudo bash tests/output-dependencies.sh && sudo bash tests/sync-lock.sh
+      - run: sudo bash tests/entrypoint.sh
   runtime:
     runs-on: ubuntu-latest
     timeout-minutes: 10

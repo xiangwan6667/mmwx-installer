@@ -20,8 +20,19 @@ echo continued >> "$ROOT/events"
 # Legacy layout continues refreshing even after the management command is removed.
 printf '{"domain":"legacy.example.com"}' > "$ROOT/state.json"
 rm "$ROOT/state/cloudflare-v4.txt"
+# shellcheck disable=SC2317,SC2329
 dc() { :; }
 sync_cf
 [[ -f $ROOT/cloudflare-v4.txt && -f $ROOT/Caddyfile ]]
 grep -q 'legacy.example.com' "$ROOT/Caddyfile"
+# Successful reloads write JSON on stderr; keep this out of the terminal.
+dc() {
+  case "$*" in
+    'ps --status running -q caddy') echo caddy-container;;
+    'exec -T caddy caddy reload --config /etc/caddy/Caddyfile') printf '{"level":"info","msg":"reload-details"}\n' >&2;;
+  esac
+}
+sync_cf > "$ROOT/screen" 2>&1
+if grep -q reload-details "$ROOT/screen"; then echo 'Caddy JSON leaked to screen'; exit 1; fi
+grep -q reload-details "$ROOT"/state/logs/*.log
 echo 'PASS: CF synchronization reports lock failure, preserves caller flow and supports legacy layout'

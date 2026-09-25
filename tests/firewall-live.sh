@@ -61,6 +61,42 @@ confirm() { return 0; }
 uninstall_script
 [[ ! -e /usr/local/bin/mmwx && ! -e /usr/local/sbin/mmwx-installer ]]
 [[ -x /usr/local/lib/mmwx-installer/runtime.sh ]]
+if bash /usr/local/lib/mmwx-installer/runtime.sh >/dev/null 2>&1; then die 'Backend reopened management menu'; fi
+if bash /usr/local/lib/mmwx-installer/runtime.sh firewall-apply status >/dev/null 2>&1; then die 'Backend accepted a management action'; fi
 systemctl restart docker
 assert_access
+# Simulate a user launching a downloaded copy and exiting the initial menu.
+cp ./install.sh /root/mmwx-install.sh
+python3 - <<'PY'
+import os, pty, select, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execl('/bin/bash', 'bash', '/root/mmwx-install.sh')
+buffer = b''
+deadline = time.monotonic() + 20
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([fd], [], [], 0.2)
+    if ready:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        buffer += data
+        if '选择：'.encode() in buffer:
+            os.write(fd, b'0\n')
+            buffer = b''
+else:
+    os.kill(pid, 15)
+    raise RuntimeError('Initial management menu did not exit')
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 0
+PY
+[[ -x /usr/local/bin/mmwx && ! -f /root/mmwx-install.sh ]]
+/usr/local/bin/mmwx --version
+# Old recognized copies are also removed when uninstalling the manager.
+cp ./install.sh /root/mmwx-install.sh
+uninstall_script
+[[ ! -e /root/mmwx-install.sh && ! -e /usr/local/bin/mmwx && ! -e /usr/local/sbin/mmwx-installer ]]
 echo 'PASS: only permitted sources reach Docker through ipset, including after UFW reload and Docker restart'

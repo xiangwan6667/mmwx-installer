@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.0
+SCRIPT_VERSION=0.2.1
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -71,13 +71,13 @@ ensure_layout() {
     systemctl stop mmwx-cf-sync.timer mmwx-cf-sync.service 2>/dev/null || true
     if [[ -f $ROOT/network-backup/state && $(cat "$ROOT/network-backup/state") == pending ]]; then
       systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
-      /bin/bash "$ROOT/network-backup/rollback.sh"
+      run_step '恢复原网络设置' /bin/bash "$ROOT/network-backup/rollback.sh"
     fi
     if [[ -f $ROOT/compose.yaml ]]; then
       if [[ -n $(docker compose -p mmwx-installer --project-directory "$ROOT" -f "$ROOT/compose.yaml" ps --status running -q) ]]; then
         touch "$ROOT/.layout-migration/was-running"
       fi
-      docker compose -p mmwx-installer --project-directory "$ROOT" -f "$ROOT/compose.yaml" down
+      run_step '停止旧目录容器' docker compose -p mmwx-installer --project-directory "$ROOT" -f "$ROOT/compose.yaml" down
     fi
     # The old app directory was named data; stage it before creating the new data parent.
     if [[ ! -f $ROOT/.layout-migration/app-staged ]]; then
@@ -349,7 +349,7 @@ install_docker() {
     printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' "$(dpkg --print-architecture)" "$ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/mmwx-docker.list
     run_step '刷新 Docker 软件源' apt-get update -qq
     run_step '安装 Docker 和 Compose' env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    systemctl enable --now docker
+    run_step '启用 Docker 服务' systemctl enable --now docker
   fi
   docker compose version >/dev/null || die '缺少 Docker Compose 插件。'
   if [[ -f /etc/docker/daemon.json ]]; then
@@ -365,7 +365,7 @@ build_caddy() {
   info '下载预编译的 Caddy + Cloudflare 模块（服务器无需编译）……'
   get "https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.1.0-rc.1/$asset" -o "$builddir/$asset"
   get 'https://github.com/xiangwan6667/mmwx-installer/releases/download/v0.1.0-rc.1/SHA256SUMS' -o "$builddir/SHA256SUMS"
-  (cd "$builddir"; grep -E "^[a-f0-9]{64}  $asset$" SHA256SUMS | sha256sum -c -) || { rm -rf "$builddir"; die 'Caddy 下载校验失败。'; }
+  (cd "$builddir"; grep -E "^[a-f0-9]{64}  $asset$" SHA256SUMS | sha256sum --status -c -) || { rm -rf "$builddir"; die 'Caddy 下载校验失败。'; }
   gzip -dc "$builddir/$asset" > "$builddir/caddy"
   chmod 0755 "$builddir/caddy"
   cat > "$builddir/Dockerfile" <<'EOF'
@@ -557,7 +557,7 @@ sync_cf() (
     # Keep the inode: Caddy mounts this individual file.
     cat "$config/Caddyfile.next" > "$config/Caddyfile"
     rm -f "$config/Caddyfile.next"
-    if [[ -n $(dc ps --status running -q caddy) ]]; then dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null; fi
+    if [[ -n $(dc ps --status running -q caddy) ]]; then run_step '重载 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile; fi
   fi
 )
 network_setup() {
@@ -571,7 +571,7 @@ network_setup() {
     fi
     if [[ $(cat "$ROOT/state/network-backup/state") == pending ]]; then
       systemctl stop mmwx-network-rollback.timer 2>/dev/null || true
-      /bin/bash "$ROOT/state/network-backup/rollback.sh"
+      run_step '恢复原网络设置' /bin/bash "$ROOT/state/network-backup/rollback.sh"
     fi
     systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
     systemctl reset-failed mmwx-network-rollback.service 2>/dev/null || true
@@ -587,7 +587,7 @@ network_setup() {
   fi
   fetch_cf "$ROOT/state/cloudflare-v4.txt" || die 'Cloudflare IP 列表获取失败。'
   install_units
-  for port in $SSH_PORTS; do ufw allow "$port/tcp" comment mmwx-ssh; done
+  for port in $SSH_PORTS; do run_step "保留 SSH 端口 $port" ufw allow "$port/tcp" comment mmwx-ssh; done
   # Schedule recovery before changing networking; cancelled only after operator acknowledgement.
   cat > "$ROOT/state/network-backup/rollback.sh" <<'EOF'
 #!/bin/bash
@@ -606,17 +606,17 @@ if grep -qx 'Status: active' "$root/state/network-backup/ufw-status"; then ufw -
 EOF
   chmod 700 "$ROOT/state/network-backup/rollback.sh"
   printf 'pending\n' > "$ROOT/state/network-backup/state"
-  systemd-run --collect --unit=mmwx-network-rollback --on-active=5m /bin/bash "$ROOT/state/network-backup/rollback.sh"
+  run_step '设置网络回退计时器' systemd-run --collect --unit=mmwx-network-rollback --on-active=5m /bin/bash "$ROOT/state/network-backup/rollback.sh"
   cat > /etc/sysctl.d/90-mmwx-ipv4-only.conf <<'EOF'
 net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 net.ipv6.conf.lo.disable_ipv6=1
 EOF
-  sysctl -p /etc/sysctl.d/90-mmwx-ipv4-only.conf
+  run_step '关闭 IPv6' sysctl -p /etc/sysctl.d/90-mmwx-ipv4-only.conf
   sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw --force enable
+  run_step '设置入站策略' ufw default deny incoming
+  run_step '设置出站策略' ufw default allow outgoing
+  run_step '启用 UFW' ufw --force enable
   apply_firewall
   remove_legacy_cf_rules
   info '请另开终端，通过 IPv4 重新 SSH 登录；5 分钟未确认将恢复网络。'
@@ -651,6 +651,7 @@ confirm_network() {
   info '已确认 SSH，取消网络自动回退。'
 }
 install_command() {
+  install -d -m 0755 /usr/local/bin /usr/local/sbin
   if [[ $SELF != /usr/local/sbin/mmwx-installer ]]; then
     local staged
     staged=$(mktemp /usr/local/sbin/.mmwx-installer.XXXXXX)
@@ -660,6 +661,32 @@ install_command() {
   if [[ -e /usr/local/bin/mmwx || -L /usr/local/bin/mmwx ]]; then
     [[ $(readlink -f /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]] || die '已有 mmwx 命令，未覆盖。'
   else ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx; fi
+}
+cleanup_downloads() {
+  local candidate owner
+  # Only known installer filenames and identifying headers; never recurse through user files.
+  for candidate in "$SELF" /root/mmwx-install.sh "$PWD/mmwx-install.sh"; do
+    [[ $candidate == */mmwx-install.sh && -f $candidate && ! -L $candidate ]] || continue
+    owner=$(stat -c %u "$candidate")
+    [[ $owner == 0 ]] || continue
+    if grep -qx '# Independent installer. Never invoke the upstream install script.' "$candidate" && grep -qx 'ROOT=/opt/mmwx-installer' "$candidate"; then
+      rm -f -- "$candidate"
+    fi
+  done
+}
+open_installed_menu() {
+  exec 7>/run/mmwx-installer.lock
+  flock -n 7 || die '另一个维护进程正在运行，请等待。'
+  if [[ $SELF != /usr/local/sbin/mmwx-installer ]]; then
+    install_command
+  fi
+  cleanup_downloads
+  exec 7>&-
+  if [[ $SELF != /usr/local/sbin/mmwx-installer ]]; then
+    # Keep only the canonical entrypoint; a stale downloaded file cannot remain the menu parent.
+    exec /bin/bash /usr/local/sbin/mmwx-installer "${MENU_ARGUMENTS[@]}"
+  fi
+  menu
 }
 install_units() {
   install_command
@@ -705,8 +732,8 @@ Persistent=true
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
-  systemctl enable mmwx-firewall.service
-  systemctl enable --now mmwx-cf-sync.timer
+  run_step '注册容器防火墙服务' systemctl enable mmwx-firewall.service
+  run_step '启用 CF 网段定时刷新' systemctl enable --now mmwx-cf-sync.timer
 }
 save_state() {
   jq -n --arg domain "$DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{domain:$domain,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/state/state.json.tmp"
@@ -714,10 +741,11 @@ save_state() {
 }
 verify_https() {
   local attempt
+  mkdir -p "$ROOT/state/logs"
   info '等待 Caddy 完成 DNS-01 签发并验证 HTTPS（最多五分钟）……'
   for ((attempt=0; attempt<60; attempt++)); do
     if curl -fsS --noproxy '*' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" -o /dev/null 2>/dev/null; then
-      if curl -fsSL --max-redirs 3 --max-time 15 "https://$DOMAIN/" -o /dev/null; then return 0; fi
+      if curl -fsSL --max-redirs 3 --max-time 15 "https://$DOMAIN/" -o /dev/null 2>> "$ROOT/state/logs/https-check.log"; then return 0; fi
     fi
     sleep 5
   done
@@ -830,6 +858,12 @@ write_update_progress() {
   jq -n --arg phase "$1" --arg backup "$2" '{phase:$phase,backup:$backup}' > "$ROOT/state/update.json.tmp"
   mv "$ROOT/state/update.json.tmp" "$ROOT/state/update.json"
 }
+backup_database() { dc exec -T postgres pg_dump -U mmwx -d mmwx -Fc > "$1"; }
+restore_database() {
+  dc exec -T postgres dropdb -U mmwx --if-exists --force mmwx
+  dc exec -T postgres createdb -U mmwx -O mmwx mmwx
+  dc exec -T postgres pg_restore -U mmwx -d mmwx --exit-on-error < "$1"
+}
 recover_update() {
   local backup phase directory
   backup=$(jq -er .backup "$ROOT/state/update.json")
@@ -842,12 +876,10 @@ recover_update() {
       [[ -s $backup/database.dump && -s $backup/files.tar.gz ]] || die '更新备份不完整，停止恢复。'
       write_update_progress restoring "$backup"
       run_step '停止主控和网关' dc stop mmwx caddy
-      dc up -d --wait --wait-timeout 120 postgres
-      dc exec -T postgres dropdb -U mmwx --if-exists --force mmwx
-      dc exec -T postgres createdb -U mmwx -O mmwx mmwx
-      dc exec -T postgres pg_restore -U mmwx -d mmwx --exit-on-error < "$backup/database.dump"
+      run_step '启动数据库' dc up -d --wait --wait-timeout 120 postgres
+      run_step '恢复数据库备份' restore_database "$backup/database.dump"
       mkdir -p "$backup/restored"
-      tar -xzf "$backup/files.tar.gz" -C "$backup/restored"
+      run_step '解压应用文件备份' tar -xzf "$backup/files.tar.gz" -C "$backup/restored"
       if [[ -d $backup/restored/data && ! -e $backup/restored/app ]]; then mv "$backup/restored/data" "$backup/restored/app"; fi
       for directory in app subscribes rule_templates; do
         if [[ -d $ROOT/data/$directory && ! -e $backup/failed-$directory ]]; then
@@ -885,11 +917,11 @@ update_stack() {
   cp "$ROOT/config/compose.yaml" "$ROOT/state/state.json" "$backup/"
   write_update_progress backing-up "$backup"
   run_step '停止主控和网关' dc stop mmwx caddy
-  if ! dc exec -T postgres pg_dump -U mmwx -d mmwx -Fc > "$backup/database.dump"; then
-    dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '数据库备份失败，已重新启动旧版本。'
+  if ! run_step '备份数据库' backup_database "$backup/database.dump"; then
+    run_step '重新启动旧版本' dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '数据库备份失败，已重新启动旧版本。'
   fi
-  if ! tar -czf "$backup/files.tar.gz" -C "$ROOT/data" app subscribes rule_templates; then
-    dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '文件备份失败，已重新启动旧版本。'
+  if ! run_step '备份应用文件' tar -czf "$backup/files.tar.gz" -C "$ROOT/data" app subscribes rule_templates; then
+    run_step '重新启动旧版本' dc start mmwx caddy; rm -f "$ROOT/state/update.json"; die '文件备份失败，已重新启动旧版本。'
   fi
   write_update_progress deploying "$backup"
   render_compose > "$ROOT/config/compose.yaml.tmp"
@@ -920,6 +952,7 @@ self_update() {
   rm -f "$downloaded"
   mv -f "$staged" /usr/local/sbin/mmwx-installer
   [[ -L /usr/local/bin/mmwx ]] || ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx
+  cleanup_downloads
   info '管理脚本已更新。'
 }
 finish_image_rollback() {
@@ -966,11 +999,11 @@ remove_services() {
   exec 8>/run/mmwx-cf.lock; flock -w 180 8 || die '防火墙正在更新，请稍后重试卸载。'
   systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
   if [[ -f $ROOT/state/network-backup/state && $(cat "$ROOT/state/network-backup/state") == pending ]]; then
-    /bin/bash "$ROOT/state/network-backup/rollback.sh"
+    run_step '恢复原网络设置' /bin/bash "$ROOT/state/network-backup/rollback.sh"
   fi
   local unit
   for unit in mmwx-cf-sync.timer mmwx-firewall.service; do
-    if [[ $(systemctl show --property=LoadState --value "$unit") != not-found ]]; then systemctl disable --now "$unit"; fi
+    if [[ $(systemctl show --property=LoadState --value "$unit") != not-found ]]; then run_step "移除后台服务 $unit" systemctl disable --now "$unit"; fi
   done
   rm -f /etc/systemd/system/docker.service.d/mmwx-firewall.conf
   while iptables -C DOCKER-USER -o br-mmwx-front -j MMWX-CF 2>/dev/null; do iptables -D DOCKER-USER -o br-mmwx-front -j MMWX-CF; done
@@ -986,6 +1019,7 @@ purge_installation() {
   rm -rf --one-file-system -- "$ROOT"
   if [[ -L /usr/local/bin/mmwx && $(readlink /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]]; then rm -f /usr/local/bin/mmwx; fi
   rm -f /usr/local/sbin/mmwx-installer
+  cleanup_downloads
   rm -f /usr/local/lib/mmwx-installer/runtime.sh
   if [[ -d /usr/local/lib/mmwx-installer ]]; then rmdir /usr/local/lib/mmwx-installer 2>/dev/null || true; fi
   if command -v docker >/dev/null; then
@@ -1019,6 +1053,7 @@ uninstall_script() {
   if [[ -f /etc/systemd/system/mmwx-cf-sync.timer || -f /etc/systemd/system/docker.service.d/mmwx-firewall.conf ]]; then install_units; fi
   if [[ -L /usr/local/bin/mmwx && $(readlink /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]]; then rm -f /usr/local/bin/mmwx; fi
   rm -f /usr/local/sbin/mmwx-installer
+  cleanup_downloads
   info '管理命令已移除。重新下载并运行安装脚本即可恢复管理。'
 }
 usage() {
@@ -1079,13 +1114,12 @@ menu() {
   [[ -z $CHANNEL ]] || arguments+=(--channel "$CHANNEL")
   while true; do
     menu_header
-    printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    9  回退主控版本\n\n  管理\n    8  更新管理脚本\n    6  卸载服务\n   10  卸载管理脚本\n\n    0  退出\n\n'
+    printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n\n  管理\n    7  更新管理脚本\n    8  卸载服务\n    9  卸载管理脚本\n\n    0  退出\n\n'
     choice=$(ask '选择：')
     case "$choice" in
       1) action=install;; 2) action=update;; 3) action=status;; 4) action=logs;;
-      5) action=resume;; 6) action=uninstall;;
-      8) action=self-update;; 9) action=rollback;;
-      10) action=uninstall-script;;
+      5) action=resume;; 6) action=rollback;;
+      7) action=self-update;; 8) action=uninstall;; 9) action=uninstall-script;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
     esac
     if /bin/bash "$SELF" "$action" "${arguments[@]}"; then
@@ -1096,6 +1130,11 @@ menu() {
   done
 }
 main() {
+  local -a MENU_ARGUMENTS=("$@")
+  if [[ $SELF == /usr/local/lib/mmwx-installer/runtime.sh ]]; then
+    [[ $# == 1 ]] || die '后台程序仅接受一个防火墙任务参数。'
+    case "${1:-}" in firewall-apply|firewall-sync) ;; *) die '此文件仅用于后台防火墙任务，管理入口已独立安装。';; esac
+  fi
   while (($#)); do
     case "$1" in
       install|update|uninstall|status|logs|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network) ACTION=$1; shift;;
@@ -1108,7 +1147,7 @@ main() {
     esac
   done
   [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
-  if [[ -z $ACTION ]]; then menu; return; fi
+  if [[ -z $ACTION ]]; then open_installed_menu; return; fi
   case "$ACTION" in install|update|uninstall|resume|self-update|uninstall-script|rollback) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
   if [[ $ACTION == install && ! -f $ROOT/state/progress.json ]]; then
     printf '\033[1;31m仅限全新环境：启用 UFW、禁用 IPv6；请用 IPv4 SSH。\033[0m\n'
