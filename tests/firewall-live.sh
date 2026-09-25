@@ -147,15 +147,36 @@ dc config --format json | jq 'del(.services.orphan)' > "$ROOT/config/compose.yam
 mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
 foreign_id=$(docker inspect --format '{{.Id}}' mmwx-firewall-test)
 foreign_started=$(docker inspect --format '{{.State.StartedAt}}' mmwx-firewall-test)
+foreign_network_id=$(docker network inspect --format '{{.Id}}' mmwx-firewall-test)
+project_ids=$(docker ps -aq --filter label=com.docker.compose.project=mmwx-installer | sort)
+project_bridges=$(docker network ls -q --filter label=com.docker.compose.project=mmwx-installer | while IFS= read -r network; do
+  docker network inspect "$network" | jq -r '.[0] | select(.Driver == "bridge") | .Options["com.docker.network.bridge.name"] // ("br-" + .Id[:12])'
+done)
 ipset create mmwx_cf_next hash:net family inet -exist
 systemd-run --collect --unit=mmwx-network-rollback --on-active=15m /bin/true
 ask() { printf '2'; }
-uninstall_stack
-[[ ! -e $ROOT && ! -e /usr/local/lib/mmwx-installer/runtime.sh ]]
-[[ -z $(docker ps -aq --filter label=com.docker.compose.project=mmwx-installer) ]]
+# A foreign workload must stop full purge before it changes project state.
+if (uninstall_stack) >/dev/null 2>&1; then die 'Full purge accepted a foreign Docker workload'; fi
+[[ -e $ROOT && -x /usr/local/lib/mmwx-installer/runtime.sh ]]
+[[ $(docker ps -aq --filter label=com.docker.compose.project=mmwx-installer | sort) == "$project_ids" ]]
 [[ $(docker inspect --format '{{.Id}}' mmwx-firewall-test) == "$foreign_id" ]]
 [[ $(docker inspect --format '{{.State.StartedAt}}' mmwx-firewall-test) == "$foreign_started" ]]
-[[ $(docker inspect --format '{{.State.Running}}' mmwx-firewall-test) == true ]]
+[[ $(docker network inspect --format '{{.Id}}' mmwx-firewall-test) == "$foreign_network_id" ]]
+docker rm -f mmwx-firewall-test
+docker network rm mmwx-firewall-test
+uninstall_stack
+[[ ! -e $ROOT && ! -e /usr/local/lib/mmwx-installer/runtime.sh ]]
+[[ ! -e /var/lib/docker && ! -e /var/lib/containerd ]]
+for interface in docker0 br-mmwx-front; do
+  if ip link show "$interface" >/dev/null 2>&1; then die "Docker bridge remains: $interface"; fi
+done
+while IFS= read -r interface; do
+  [[ -z $interface ]] || { if ip link show dev "$interface" >/dev/null 2>&1; then die "Project bridge remains: $interface"; fi; }
+done <<< "$project_bridges"
+if command -v docker >/dev/null; then die 'Docker command remains'; fi
+for package in docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker.io moby-engine moby-cli moby-containerd; do
+  if dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii'; then die "Docker package remains installed: $package"; fi
+done
 [[ -x /usr/local/bin/mmwx && -x /usr/local/sbin/mmwx-installer ]]
 /usr/local/bin/mmwx --version
 for unit in mmwx-firewall.service mmwx-cf-sync.service mmwx-cf-sync.timer mmwx-network-rollback.service mmwx-network-rollback.timer; do
@@ -164,9 +185,9 @@ for unit in mmwx-firewall.service mmwx-cf-sync.service mmwx-cf-sync.timer mmwx-n
   if systemctl is-enabled --quiet "$unit"; then die "Project unit remains enabled: $unit"; fi
 done
 [[ ! -e /etc/systemd/system/docker.service.d/mmwx-firewall.conf ]]
-if systemctl cat docker.service | grep -Fq mmwx-installer; then die 'Docker retains the project startup hook'; fi
+if systemctl list-unit-files docker.service --no-legend 2>/dev/null | grep -q '^docker.service'; then die 'Docker service remains installed'; fi
 if iptables -nL MMWX-CF >/dev/null 2>&1; then die 'Project firewall chain remains'; fi
-if iptables -S DOCKER-USER | grep -Fq MMWX-CF; then die 'Docker retains the project firewall jump'; fi
+if iptables-save | grep -q '^:DOCKER'; then die 'Docker firewall chains remain'; fi
 if ipset list -name | grep -Eq '^mmwx_cf(_next)?$'; then die 'Project ipset remains'; fi
 diff -r "$baseline/ufw" /etc/ufw
 cmp "$baseline/ufw-default" /etc/default/ufw
@@ -176,4 +197,4 @@ cmp "$baseline/ufw-status" "$baseline/ufw-restored"
 for interface in all default lo mmwx-host; do
   [[ $(sysctl -n "net.ipv6.conf.$interface.disable_ipv6") == "$(cat "$baseline/ipv6-$interface")" ]]
 done
-echo 'PASS: Docker Cloudflare filtering and full purge restore networking, remove project resources, and retain the manager and unrelated container'
+echo 'PASS: Docker Cloudflare filtering and full purge restore networking, remove Docker and project resources, and retain the manager'

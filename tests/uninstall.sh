@@ -28,7 +28,9 @@ ipset() { return 1; }
 remove_legacy_cf_rules() { :; }
 network_restore_preflight() { echo checked >> "$tmp/network-calls"; [[ ${RESTORE_FAIL:-} != preflight ]]; }
 restore_install_network() { echo restored >> "$tmp/network-calls"; [[ ${RESTORE_FAIL:-} != restore ]]; }
-docker() { [[ $* == 'image rm mmwx-installer-caddy:2.11.4-cf0.2.4' ]]; }
+# Docker teardown has its own filesystem and failure fixtures.
+docker_purge_preflight() { :; }
+purge_docker() { echo docker-purged >> "$tmp/network-calls"; }
 # Match the supported root execution while keeping all filesystem operations real.
 stat() { printf '0\n'; }
 
@@ -82,7 +84,7 @@ assert_manager_retained
 : > "$tmp/calls"; : > "$tmp/network-calls"
 uninstall_stack > "$tmp/output"
 [[ $(cat "$tmp/calls") == removed && ! -e $ROOT ]]
-[[ $(cat "$tmp/network-calls") == $'checked\nrestored' ]]
+[[ $(cat "$tmp/network-calls") == $'checked\ndocker-purged\nrestored' ]]
 [[ ! -e $host/etc/systemd/system/mmwx-network-rollback.service && ! -e $host/etc/systemd/system/mmwx-network-rollback.timer ]]
 [[ ! -e $host/usr/local/lib/mmwx-installer/runtime.sh && ! -e $host/root/mmwx-install.sh ]]
 grep -q '永久删除' "$tmp/prompts"

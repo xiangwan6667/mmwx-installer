@@ -14,7 +14,7 @@
 
 </div>
 
-通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.8**。
+通过 Docker Compose 部署 [妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，完成 Cloudflare DNS 配置、HTTPS 签发及访问防护。当前管理脚本版本为 **v0.2.9**。
 
 ## 功能
 
@@ -176,11 +176,11 @@ Caddy 与 Cloudflare DNS 模块使用本仓库的 [预编译依赖包](https://g
 
 | 操作 | 删除内容 | 保留内容 |
 | --- | --- | --- |
-| 菜单 10 → 保留数据（默认） | 容器、本项目防火墙规则及定时任务 | 项目目录、备份、Token 和管理命令，可用菜单 5 恢复 |
-| 菜单 10 → 完全卸载 | 项目容器及遗留容器、防火墙链与 ipset、定时任务、项目目录、备份、Token 和后台程序；恢复安装前的 UFW 与 IPv6 | `mmwx` 管理命令、Docker、系统时区及 Cloudflare DNS 记录 |
+| 菜单 10 → 保留数据（默认） | 容器、本项目防火墙规则及定时任务 | 项目目录、备份、Token、Docker 引擎与镜像、管理命令；可用菜单 5 恢复 |
+| 菜单 10 → 完全卸载 | 项目容器及遗留容器、所有 Docker 镜像与网络、Docker 和 containerd 数据目录及软件包、防火墙链与 ipset、定时任务、项目目录、备份、Token 和后台程序；恢复安装前的 UFW 与 IPv6 | `mmwx` 管理命令、系统时区及 Cloudflare DNS 记录 |
 | 菜单 11 → 卸载管理脚本 | `mmwx` 管理入口 | 容器、数据和后台防火墙程序，继续提供重启防护及网段刷新 |
 
-两种服务卸载方式都保留 `mmwx` 管理菜单。保留数据模式保留当前 UFW/IPv6 配置，方便恢复服务；完全卸载恢复原 UFW 规则、启用状态和 IPv6 配置。备份缺失或恢复失败时停止删除数据，可从菜单 10 重试。
+两种服务卸载方式都保留 `mmwx` 管理菜单。保留数据模式保留当前 UFW/IPv6 配置，方便恢复服务；完全卸载恢复原 UFW 规则、启用状态和 IPv6 配置。完全卸载前会检查其他容器（包括已停止的容器）、卷、非默认网络及 containerd 工作负载；发现其他业务时拒绝清理。备份缺失或恢复失败时停止删除数据，可从菜单 10 重试。
 
 新安装会记录各网卡的 IPv6 状态；旧版备份仅能恢复当时记录的 `all/default/lo` 配置。移除管理菜单需单独选择菜单 11，之后重新执行安装命令即可恢复入口。
 

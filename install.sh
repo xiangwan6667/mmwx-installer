@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.8
+SCRIPT_VERSION=0.2.9
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -1340,6 +1340,189 @@ rollback_stack() {
   mv "$ROOT/state/image-rollback.json.tmp" "$ROOT/state/image-rollback.json"
   finish_image_rollback
 }
+docker_purge_paths_check() {
+  local path mounted mountpoint
+  for path in /var/lib/docker /var/lib/containerd /etc/docker; do
+    [[ ! -L $path && $(readlink -m "$path") == "$path" ]] || die "Docker 目录异常：$path，停止卸载。"
+    mounted=$(findmnt -rn -o TARGET) || return 1
+    while IFS= read -r mountpoint; do
+      [[ $mountpoint != "$path" && $mountpoint != "$path/"* ]] || die "Docker 目录存在挂载：$mountpoint，请先处理后重试。"
+    done <<< "$mounted"
+  done
+}
+docker_purge_firewall() {
+  # Docker may leave its chains after dockerd stops. Remove only Docker chains,
+  # jumps to those chains and rules naming a recorded bridge; never flush tables.
+  python3 - "$ROOT/state/docker-purge.json" <<'PY'
+import json, shlex, shutil, subprocess, sys
+bridges = set(json.load(open(sys.argv[1], encoding='utf-8'))['bridges'])
+for binary in ('iptables', 'ip6tables'):
+    if not shutil.which(binary + '-save'):
+        continue
+    saved = subprocess.check_output([binary + '-save'], text=True)
+    table = None
+    chains = set()
+    rules = []
+    def clean():
+        if not table:
+            return
+        for rule in rules:
+            targets = [rule[i + 1] for i, value in enumerate(rule[:-1]) if value in ('-j', '-g')]
+            interfaces = [rule[i + 1] for i, value in enumerate(rule[:-1]) if value in ('-i', '-o')]
+            if rule[1] not in chains and (chains.intersection(targets) or bridges.intersection(interfaces)):
+                subprocess.run([binary, '-w', '10', '-t', table, '-D', *rule[1:]], check=True)
+        for chain in sorted(chains):
+            subprocess.run([binary, '-w', '10', '-t', table, '-F', chain], check=True)
+        for chain in sorted(chains):
+            subprocess.run([binary, '-w', '10', '-t', table, '-X', chain], check=True)
+    for line in saved.splitlines():
+        if line.startswith('*'):
+            table, chains, rules = line[1:], set(), []
+        elif line.startswith(':DOCKER'):
+            name = line[1:].split()[0]
+            if name == 'DOCKER' or name.startswith('DOCKER-'):
+                chains.add(name)
+        elif line.startswith('-A '):
+            rules.append(shlex.split(line))
+        elif line == 'COMMIT':
+            clean()
+PY
+}
+docker_purge_preflight() {
+  local journal=$ROOT/state/docker-purge.json details id label network name bridge phase
+  local -a bridges=()
+  [[ ! -L $ROOT && ! -L $ROOT/state && ! -L $journal ]] || die 'Docker 卸载记录路径异常。'
+  if [[ -f $journal ]]; then
+    jq -e '(.phase == "prepared" or .phase == "stopping" or .phase == "removed") and (.bridges | type == "array") and all(.bridges[]; type == "string" and test("^[a-zA-Z0-9_.-]{1,15}$") and . != "lo")' "$journal" >/dev/null || die 'Docker 卸载记录无效。'
+    phase=$(jq -r .phase "$journal")
+    if [[ $phase == stopping || $phase == removed ]]; then
+      if systemctl is-active --quiet docker.service || systemctl is-active --quiet containerd.service; then
+        # Recheck workloads if services were started again after interruption.
+        mapfile -t bridges < <(jq -r '.bridges[]' "$journal")
+      else
+        docker_purge_paths_check; return
+      fi
+    fi
+  fi
+  [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]] || die '请取消 DOCKER_HOST/DOCKER_CONTEXT 后卸载本机 Docker。'
+  if [[ -f /etc/containerd/config.toml ]]; then
+    # Only the top-level storage paths matter; plugin-specific roots are scoped.
+    python3 - /etc/containerd/config.toml <<'PY' || return 1
+import re, sys
+for line in open(sys.argv[1], encoding='utf-8'):
+    if line.lstrip().startswith('['):
+        break
+    match = re.match(r'''\s*(root|state)\s*=\s*['"]([^'"]+)['"]''', line)
+    if match and match[2] != {'root': '/var/lib/containerd', 'state': '/run/containerd'}[match[1]]:
+        sys.exit('containerd 使用自定义目录，停止完全卸载。')
+PY
+  fi
+  if command -v docker >/dev/null; then
+    [[ $(docker context inspect --format '{{.Endpoints.docker.Host}}') == unix:///var/run/docker.sock ]] || die '仅支持卸载本机默认 Docker。'
+    details=$(docker info --format '{{json .}}') || die 'Docker 无法连接，未开始卸载，请恢复 Docker 后重试。'
+    jq -e '.DockerRootDir == "/var/lib/docker" and .Swarm.LocalNodeState == "inactive" and ([.SecurityOptions[]? | select(contains("rootless"))] | length == 0)' <<< "$details" >/dev/null || die 'Docker 使用自定义目录、Swarm 或 rootless 模式，停止完全卸载。'
+    details=$(docker ps -aq) || return 1
+    while IFS= read -r id; do
+      [[ -n $id ]] || continue
+      label=$(docker inspect "$id" --format '{{index .Config.Labels "com.docker.compose.project"}}') || return 1
+      [[ $label == mmwx-installer ]] || die "发现其他项目容器 $id，停止完全卸载；可选择保留数据模式。"
+    done <<< "$details"
+    details=$(docker volume ls -q) || return 1
+    while IFS= read -r id; do
+      [[ -n $id ]] || continue
+      label=$(docker volume inspect "$id" --format '{{index .Labels "com.docker.compose.project"}}') || return 1
+      [[ $label == mmwx-installer ]] || die "发现其他项目存储卷 $id，停止完全卸载。"
+    done <<< "$details"
+    details=$(docker network ls -q) || return 1
+    while IFS= read -r id; do
+      [[ -n $id ]] || continue
+      network=$(docker network inspect "$id") || return 1
+      name=$(jq -er '.[0].Name' <<< "$network") || return 1
+      case "$name" in bridge|host|none) :;;
+        *) jq -e '.[0].Labels["com.docker.compose.project"] == "mmwx-installer"' <<< "$network" >/dev/null || die "发现其他项目网络 $name，停止完全卸载。";;
+      esac
+      if [[ $(jq -r '.[0].Driver' <<< "$network") == bridge ]]; then
+        bridge=$(jq -r '.[0] | .Options["com.docker.network.bridge.name"] // ("br-" + .Id[:12])' <<< "$network") || return 1
+        [[ $bridge =~ ^[a-zA-Z0-9_.-]{1,15}$ && $bridge != lo ]] || die 'Docker 网桥名称异常。'
+        bridges+=("$bridge")
+      fi
+    done <<< "$details"
+  elif [[ -d /var/lib/docker ]]; then
+    die 'Docker 命令缺失但数据目录仍存在，无法核对用途，停止卸载。'
+  fi
+  if systemctl is-active --quiet containerd.service; then
+    command -v ctr >/dev/null || die '无法核对 containerd 任务，停止卸载。'
+    details=$(ctr --address /run/containerd/containerd.sock namespaces list -q) || return 1
+    while IFS= read -r name; do
+      [[ -n $name && $name != moby ]] || continue
+      id=$(ctr --address /run/containerd/containerd.sock --namespace "$name" containers list -q) || return 1
+      [[ -z $id ]] || die "containerd 中存在其他项目：$name，停止卸载。"
+    done <<< "$details"
+  elif [[ -d /var/lib/containerd && -n $(find /var/lib/containerd -mindepth 1 -print -quit) ]]; then
+    die 'containerd 已停止但仍有数据，无法核对其他任务，请恢复 containerd 后重试。'
+  fi
+  # Validate fixed deletion paths before persisting authorization for retry.
+  # Running containers mount overlay paths; those are checked after teardown.
+  for name in /var/lib/docker /var/lib/containerd /etc/docker; do
+    [[ ! -L $name && $(readlink -m "$name") == "$name" ]] || die "Docker 目录异常：$name。"
+  done
+  mkdir -p "$ROOT/state" || return 1
+  jq -n --args '{phase:"prepared",bridges:$ARGS.positional}' "${bridges[@]}" > "$journal.tmp" || return 1
+  mv "$journal.tmp" "$journal" || return 1
+}
+docker_purge_phase() {
+  jq --arg phase "$1" '.phase=$phase' "$ROOT/state/docker-purge.json" > "$ROOT/state/docker-purge.json.tmp" &&
+    mv "$ROOT/state/docker-purge.json.tmp" "$ROOT/state/docker-purge.json"
+}
+purge_docker() {
+  local phase ids unit package bridge journal=$ROOT/state/docker-purge.json
+  local -a packages=()
+  phase=$(jq -er .phase "$journal") || return 1
+  if [[ $phase == prepared ]] && command -v docker >/dev/null; then
+    # Labels cover orphaned containers and networks even if Compose was removed.
+    ids=$(docker ps -aq --filter label=com.docker.compose.project=mmwx-installer) || return 1
+    while IFS= read -r id; do [[ -z $id ]] || docker rm -f -v "$id" || return 1; done <<< "$ids"
+    ids=$(docker network ls -q --filter label=com.docker.compose.project=mmwx-installer) || return 1
+    while IFS= read -r id; do [[ -z $id ]] || docker network rm "$id" || return 1; done <<< "$ids"
+    [[ -z $(docker ps -aq) ]] || die '出现新的容器，停止 Docker 卸载。'
+  fi
+  docker_purge_phase stopping || return 1
+  for unit in docker.socket docker.service containerd.service; do
+    if [[ $(systemctl show --property=LoadState --value "$unit") != not-found ]]; then
+      systemctl disable --now "$unit" || return 1
+      if systemctl is-active --quiet "$unit"; then return 1; fi
+    fi
+  done
+  docker_purge_paths_check || return 1
+  for package in docker-ce docker-ce-cli docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin containerd.io docker.io docker-compose-v2 docker-compose docker-buildx containerd runc moby-engine moby-cli moby-buildx moby-compose moby-containerd moby-runc; do
+    if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Eq 'installed$|config-files$'; then packages+=("$package"); fi
+  done
+  if ((${#packages[@]})); then
+    local simulation removed candidate known
+    simulation=$(apt-get -s purge "${packages[@]}") || return 1
+    while IFS= read -r removed; do
+      [[ -n $removed ]] || continue
+      known=0
+      for candidate in "${packages[@]}"; do [[ $removed != "$candidate" ]] || known=1; done
+      [[ $known == 1 ]] || die "卸载 Docker 将连带移除 $removed，已停止，请先处理依赖。"
+    done < <(awk '$1 == "Remv" || $1 == "Purg" {print $2}' <<< "$simulation")
+    env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages[@]}" || return 1
+  fi
+  hash -r
+  if command -v docker >/dev/null; then die '仍存在非软件包安装的 Docker 命令，请移除后重试完全卸载。'; fi
+  docker_purge_firewall || return 1
+  # Only recorded Docker bridges are removed; arbitrary veth/host NICs are kept.
+  while IFS= read -r bridge; do
+    [[ $bridge =~ ^[a-zA-Z0-9_.-]{1,15}$ && $bridge != lo ]] || return 1
+    if ip link show dev "$bridge" >/dev/null 2>&1; then
+      ip link delete dev "$bridge" type bridge || return 1
+    fi
+  done < <(jq -r '.bridges[]' "$journal")
+  rm -rf --one-file-system -- /var/lib/docker /var/lib/containerd /etc/docker || return 1
+  rm -f /etc/apt/sources.list.d/mmwx-docker.list /etc/apt/keyrings/docker.asc || return 1
+  systemctl daemon-reload || return 1
+  docker_purge_phase removed
+}
 remove_services() {
   local unit
   systemctl stop mmwx-cf-sync.timer mmwx-cf-sync.service 2>/dev/null || true
@@ -1359,7 +1542,9 @@ remove_services() {
   rm -f /etc/systemd/system/mmwx-firewall.service /etc/systemd/system/mmwx-cf-sync.{service,timer} /etc/systemd/system/mmwx-network-rollback.{service,timer}
   rm -f /var/lib/systemd/timers/stamp-mmwx-cf-sync.timer
   systemctl daemon-reload || return 1
-  if [[ -f $ROOT/config/compose.yaml || -f $ROOT/compose.yaml ]]; then
+  if [[ -f $ROOT/state/docker-purge.json && $(jq -r .phase "$ROOT/state/docker-purge.json") != prepared ]]; then
+    : # Docker was stopped or removed by an interrupted full uninstall.
+  elif [[ -f $ROOT/config/compose.yaml || -f $ROOT/compose.yaml ]]; then
     run_step '移除项目容器' dc down --remove-orphans || return 1
   fi
   while iptables -C DOCKER-USER -o br-mmwx-front -j MMWX-CF 2>/dev/null; do iptables -D DOCKER-USER -o br-mmwx-front -j MMWX-CF || return 1; done
@@ -1384,9 +1569,6 @@ purge_installation() {
   cleanup_downloads
   rm -f /usr/local/lib/mmwx-installer/runtime.sh
   if [[ -d /usr/local/lib/mmwx-installer ]]; then rmdir /usr/local/lib/mmwx-installer 2>/dev/null || true; fi
-  if command -v docker >/dev/null; then
-    docker image rm mmwx-installer-caddy:2.11.4-cf0.2.4 >/dev/null 2>&1 || true
-  fi
 }
 uninstall_stack() {
   caddy_token_pending_guard
@@ -1398,19 +1580,24 @@ uninstall_stack() {
     [[ ! -f $state/update.json ]] || die '请先恢复未完成的更新。'
     [[ ! -f $state/image-rollback.json ]] || die '请先继续未完成的版本回退。'
   done
-  printf '1. 卸载并保留数据（默认）\n2. 完全卸载（删除数据，恢复防火墙和 IPv6）\n'
+  printf '1. 卸载并保留数据（默认）\n2. 完全卸载（含 Docker、镜像、网络及全部数据）\n'
   mode=$(ask '选择 [1]：')
   case "$mode" in
     ''|1) mode=keep; confirm '卸载服务并保留数据？' || return 0;;
-    2) mode=purge; confirm "完全卸载并永久删除 $ROOT 中的数据、备份和 Token，同时恢复安装前的防火墙和 IPv6？" || return 0;;
+    2) mode=purge; confirm "完全卸载 Docker、全部镜像、缓存、存储卷和网络，永久删除 $ROOT 中的数据、备份和 Token，并恢复防火墙和 IPv6？" || return 0;;
     *) die '无效选择。';;
   esac
-  if [[ $mode == purge ]]; then network_restore_preflight || die '网络备份不可用，停止卸载。'; fi
+  if [[ $mode == keep && -f $ROOT/state/docker-purge.json ]]; then die '完全卸载尚未完成，请选择完全卸载继续。'; fi
+  if [[ $mode == purge ]]; then
+    network_restore_preflight || die '网络备份不可用，停止卸载。'
+    docker_purge_preflight || die 'Docker 检查失败，停止卸载。'
+  fi
   remove_services "$mode" || die '服务清理未完成，数据保留；请从菜单 10 重试。'
   if [[ $mode == purge ]]; then
+    run_step '清理 Docker、镜像、缓存和网络' purge_docker || die 'Docker 清理未完成，保留进度；请从菜单 10 重试完全卸载。'
     run_step '恢复安装前的防火墙和 IPv6' restore_install_network || die '网络恢复失败，数据与备份保留；请从菜单 10 重试。'
     purge_installation
-    info '项目容器、定时任务、后台脚本及数据已删除，防火墙和 IPv6 已恢复。mmwx 管理菜单、Docker、系统时区及 Cloudflare DNS 记录保留。'
+    info 'Docker、镜像、缓存、存储卷、虚拟网络及项目数据已删除，防火墙和 IPv6 已恢复。mmwx 管理菜单、系统时区及 Cloudflare DNS 记录保留。'
   else
     info "已卸载容器，数据保留于 $ROOT。运行 mmwx 选择恢复服务。"
   fi
@@ -1964,6 +2151,11 @@ main() {
   [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
   if [[ -z $ACTION ]]; then open_installed_menu; return; fi
   case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  if [[ -f $ROOT/state/docker-purge.json ]]; then
+    case "$ACTION" in install|update|reinstall|resume|rollback|caddy-reload|caddy-restart|caddy-token)
+      die '完全卸载尚未完成，请从菜单 10 继续。';;
+    esac
+  fi
   case "$ACTION" in caddy-reload|caddy-restart|caddy-token)
     caddy_require_install write; caddy_require_idle; caddy_token_pending_guard; caddy_lock_cf
     caddy_refresh_runtime || die '后台程序更新失败，未修改 Caddy。';;
