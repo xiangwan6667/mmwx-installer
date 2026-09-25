@@ -30,6 +30,7 @@ source ./install.sh
 ROOT=$TEST_ROOT
 preflight() { :; }
 install_command() { :; }
+configure_timezone() { :; }
 # Git Bash cannot apply Linux directory modes; Linux CI uses real install.
 case $(uname -s) in MINGW*|MSYS*) install() { mkdir -p "${@: -1}"; };; esac
 install_docker() { :; }

@@ -33,6 +33,9 @@ valid_domain() {
 select_release() {
   jq -ce --arg channel "$1" '[.[] | select(.draft == false and (.prerelease == ($channel == "beta"))) | select(.published_at != null)] | sort_by(.published_at) | last | select(. != null)'
 }
+recent_releases() {
+  jq -ce '[.[] | select(.draft == false and .published_at != null)] | unique_by(.tag_name) | sort_by(.published_at) | reverse | .[:5]'
+}
 parse_release_html() {
   python3 -c 'import sys,re,json,html
 s=sys.stdin.read()
@@ -97,10 +100,13 @@ services:
     restart: unless-stopped
     ports: ["0.0.0.0:80:80/tcp", "0.0.0.0:443:443/tcp"]
     env_file: [caddy.env]
+    environment: {TZ: Asia/Shanghai}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy-data:/data
       - ./caddy-config:/config
+      - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
+      - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
     networks: [frontend]
     depends_on:
       mmwx: {condition: service_healthy}
@@ -109,6 +115,7 @@ services:
     restart: unless-stopped
     env_file: [app.env]
     environment:
+      TZ: Asia/Shanghai
       PORT: "12889"
       MMWX_DATABASE_DRIVER: postgres
       MMWX_DATABASE_HOST: postgres
@@ -120,6 +127,8 @@ services:
       - ./data:/app/data
       - ./subscribes:/app/subscribes
       - ./rule_templates:/app/rule_templates
+      - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
+      - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
     networks: [frontend, database]
     depends_on:
       postgres: {condition: service_healthy}
@@ -133,8 +142,12 @@ services:
     image: $PG_IMAGE
     restart: unless-stopped
     env_file: [postgres.env]
-    environment: {POSTGRES_DB: mmwx, POSTGRES_USER: mmwx}
-    volumes: ["./postgres-data:/var/lib/postgresql"]
+    environment: {POSTGRES_DB: mmwx, POSTGRES_USER: mmwx, TZ: Asia/Shanghai, PGTZ: Asia/Shanghai}
+    command: [postgres, -c, timezone=Asia/Shanghai, -c, log_timezone=Asia/Shanghai]
+    volumes:
+      - ./postgres-data:/var/lib/postgresql
+      - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
+      - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
     networks: [database]
     healthcheck:
       test: [CMD-SHELL, "pg_isready -U mmwx -d mmwx"]
@@ -212,6 +225,12 @@ dependencies() {
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl jq python3 ufw ipset openssl >/dev/null
 }
+configure_timezone() {
+  if [[ ! -f /usr/share/zoneinfo/Asia/Shanghai ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tzdata >/dev/null
+  fi
+  timedatectl set-timezone Asia/Shanghai
+}
 install_docker() {
   if ! command -v docker >/dev/null; then
     # shellcheck disable=SC1091
@@ -261,11 +280,27 @@ choose_version() {
   done
   if [[ -z $CHANNEL || ( $ACTION == update && $CHANNEL_EXPLICIT == 0 && $ACCEPT == 0 ) ]]; then
     local choice
-    choice=$(ask "选择 1=正式版（推荐）/ 2=Beta [回车沿用 ${CHANNEL:-stable}]：")
-    case "$choice" in '') CHANNEL=${CHANNEL:-stable};; 1) CHANNEL=stable;; 2) CHANNEL=beta;; *) die '无效选择。';; esac
+    choice=$(ask "1=正式版 / 2=Beta / 3=指定版本 [回车沿用 ${CHANNEL:-stable}]：")
+    case "$choice" in
+      '') CHANNEL=${CHANNEL:-stable};; 1) CHANNEL=stable;; 2) CHANNEL=beta;;
+      3)
+        local recent count number
+        recent=$(recent_releases <<<"$pages")
+        count=$(jq length <<<"$recent")
+        [[ $count -gt 0 ]] || die '没有可选版本。'
+        jq -r 'to_entries[] | "\(.key+1). \(.value.tag_name)  \(.value.published_at[:10])"' <<<"$recent"
+        number=$(ask '版本编号：')
+        [[ $number =~ ^[1-5]$ && $number -le $count ]] || die '无效编号。'
+        selected=$(jq -c --argjson index "$((number-1))" '.[$index]' <<<"$recent")
+        CHANNEL=$(jq -r 'if .prerelease then "beta" else "stable" end' <<<"$selected")
+        ;;
+      *) die '无效选择。';;
+    esac
+  else
+    selected=''
   fi
   [[ $CHANNEL == stable || $CHANNEL == beta ]] || die 'channel 只能是 stable 或 beta。'
-  selected=$(select_release "$CHANNEL" <<<"$pages") || die "没有可用的 $CHANNEL 版本。"
+  if [[ ${choice:-} != 3 ]]; then selected=$(select_release "$CHANNEL" <<<"$pages") || die "没有可用的 $CHANNEL 版本。"; fi
   VERSION=$(jq -r .tag_name <<<"$selected")
   [[ $VERSION =~ ^v?[0-9][A-Za-z0-9._-]*$ ]] || die '上游版本号格式异常。'
   APP_IMAGE="ghcr.io/iluobei/miaomiaowux:${VERSION#v}"
@@ -364,19 +399,22 @@ COMMIT
 EOF
   iptables -C DOCKER-USER -o br-mmwx-front -j MMWX-CF 2>/dev/null || iptables -I DOCKER-USER 1 -o br-mmwx-front -j MMWX-CF
 }
+remove_legacy_cf_rules() {
+  # Delete only this installer's old UFW web permits. Descending numbers avoid renumbering errors.
+  local numbers number
+  numbers=$(LC_ALL=C ufw status numbered | sed -nE 's/^\[[[:space:]]*([0-9]+)\][[:space:]]+80,443\/tcp[[:space:]]+ALLOW IN[[:space:]]+.*[[:space:]]#[[:space:]]mmwx-cf[[:space:]]*$/\1/p' | sort -rn)
+  while IFS= read -r number; do
+    [[ -n $number ]] || continue
+    ufw --force delete "$number" >/dev/null
+  done <<<"$numbers"
+}
 sync_cf() {
   exec 8>/run/mmwx-cf.lock; flock -n 8 || exit 0
-  local old=$ROOT/cloudflare-v4.txt new=$ROOT/cloudflare-v4.new cidr
+  local old=$ROOT/cloudflare-v4.txt new=$ROOT/cloudflare-v4.new
   fetch_cf "$new" || { printf 'Cloudflare IP 更新失败，保留现有规则。\n' >&2; return 1; }
-  # Add new permits first, then remove only rules previously owned by this project.
-  while IFS= read -r cidr; do ufw allow from "$cidr" to any port 80,443 proto tcp comment mmwx-cf >/dev/null; done < "$new"
-  if [[ -f $old ]]; then
-    while IFS= read -r cidr; do
-      grep -Fxq "$cidr" "$new" || ufw delete allow from "$cidr" to any port 80,443 proto tcp >/dev/null
-    done < "$old"
-  fi
   mv "$new" "$old"
   apply_firewall
+  remove_legacy_cf_rules
   if [[ -f $ROOT/state.json ]]; then
     DOMAIN=$(jq -er .domain "$ROOT/state.json")
     render_caddy > "$ROOT/Caddyfile.next"
@@ -392,6 +430,7 @@ network_setup() {
     if [[ $(cat "$ROOT/network-backup/state") == confirmed ]]; then
       network_is_ready || die '已确认的网络设置发生变化，请检查 UFW/IPv6 后继续。'
       apply_firewall
+      remove_legacy_cf_rules
       return
     fi
     if [[ $(cat "$ROOT/network-backup/state") == pending ]]; then
@@ -441,9 +480,9 @@ EOF
   sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
   ufw default deny incoming
   ufw default allow outgoing
-  while IFS= read -r port; do ufw allow from "$port" to any port 80,443 proto tcp comment mmwx-cf; done < "$ROOT/cloudflare-v4.txt"
   ufw --force enable
   apply_firewall
+  remove_legacy_cf_rules
   info '请另开终端，通过 IPv4 重新 SSH 登录；5 分钟未确认将恢复网络。'
   if [[ $ACCEPT == 0 ]]; then
     confirm '新 SSH 已登录成功？' || die '未确认，等待网络回退；稍后用 mmwx 继续。'
@@ -597,6 +636,7 @@ install_stack() {
     dependencies
     checkpoint 1
   fi
+  configure_timezone
   if ((STAGE<2)); then
     if [[ -z $TOKEN_FILE && -f $ROOT/cloudflare.token ]]; then TOKEN_FILE=$ROOT/cloudflare.token; fi
     if [[ -z $TOKEN_FILE ]]; then
@@ -680,8 +720,10 @@ update_stack() {
   preflight
   install_command
   if [[ -f $ROOT/update.json ]]; then recover_update; return; fi
+  [[ ! -f $ROOT/image-rollback.json ]] || die '请先继续未完成的版本回退。'
   [[ ! -f $ROOT/progress.json ]] || [[ $(jq -r .stage "$ROOT/progress.json") == 7 ]] || die '请先继续完成安装。'
   load_state
+  configure_timezone
   local backup
   choose_version
   mkdir -p "$ROOT/backups"
@@ -707,20 +749,106 @@ update_stack() {
     die '新版本健康检查失败，已恢复旧版本和数据库。'
   fi
 }
-uninstall_stack() {
+self_update() {
+  local downloaded staged
+  downloaded=$(mktemp)
+  if ! get https://raw.githubusercontent.com/xiangwan6667/mmwx-installer/main/install.sh -o "$downloaded"; then
+    rm -f "$downloaded"; die '下载失败，保留当前管理脚本。'
+  fi
+  if ! head -1 "$downloaded" | grep -qx '#!/usr/bin/env bash' || ! bash -n "$downloaded" || ! grep -q '^self_update() {' "$downloaded"; then
+    rm -f "$downloaded"; die '管理脚本校验失败，保留当前版本。'
+  fi
+  if [[ -e /usr/local/bin/mmwx || -L /usr/local/bin/mmwx ]]; then
+    [[ $(readlink -f /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]] || { rm -f "$downloaded"; die '已有其他 mmwx 命令。'; }
+  fi
+  staged=$(mktemp /usr/local/sbin/.mmwx-installer.XXXXXX)
+  install -m 0700 "$downloaded" "$staged"
+  rm -f "$downloaded"
+  mv -f "$staged" /usr/local/sbin/mmwx-installer
+  [[ -L /usr/local/bin/mmwx ]] || ln -s /usr/local/sbin/mmwx-installer /usr/local/bin/mmwx
+  info '管理脚本已更新。'
+}
+finish_image_rollback() {
   load_state
+  VERSION=$(jq -er .version "$ROOT/image-rollback.json")
+  APP_IMAGE=$(jq -er .app "$ROOT/image-rollback.json")
+  CHANNEL=$(jq -er .channel "$ROOT/image-rollback.json")
+  docker pull "$APP_IMAGE"
+  render_compose > "$ROOT/compose.yaml.tmp"
+  mv "$ROOT/compose.yaml.tmp" "$ROOT/compose.yaml"
+  # Only recreate the controller. PostgreSQL, Caddy and all persisted data stay in place.
+  dc up -d --no-deps --wait --wait-timeout 300 mmwx
+  save_state
+  rm -f "$ROOT/image-rollback.json"
+  info "主控已切换至 $VERSION，数据库和文件未还原。"
+}
+rollback_stack() {
+  preflight; load_state
   [[ ! -f $ROOT/update.json ]] || die '请先恢复未完成的更新。'
-  confirm '卸载服务并保留数据？' || return 0
-  dc down
+  if [[ -f $ROOT/image-rollback.json ]]; then finish_image_rollback; return; fi
+  local snapshot version number index=0
+  local -a choices=()
+  while IFS= read -r snapshot; do
+    version=$(jq -er .version "$snapshot") || continue
+    [[ $(jq -r .app "$snapshot") != "$APP_IMAGE" ]] || continue
+    choices+=("$snapshot")
+    index=$((index+1))
+    printf '%s. %s (%s)\n' "$index" "$version" "$(basename "$(dirname "$snapshot")")"
+    [[ $index -lt 5 ]] || break
+  done < <(find "$ROOT/backups" -mindepth 2 -maxdepth 2 -name state.json -type f 2>/dev/null | sort -r)
+  [[ $index -gt 0 ]] || die '暂无历史版本。可在更新中选择近期版本。'
+  number=$(ask '回退版本编号：')
+  [[ $number =~ ^[1-5]$ && $number -le $index ]] || die '无效编号。'
+  snapshot=${choices[$((number-1))]}
+  confirm '只回退主控版本，保留当前数据；旧版本可能不兼容当前数据库。继续？' || return 0
+  jq '{version,app,channel}' "$snapshot" > "$ROOT/image-rollback.json.tmp"
+  mv "$ROOT/image-rollback.json.tmp" "$ROOT/image-rollback.json"
+  finish_image_rollback
+}
+remove_services() {
+  if [[ -f $ROOT/compose.yaml ]]; then dc down; fi
+  systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
+  if [[ -f $ROOT/network-backup/state && $(cat "$ROOT/network-backup/state") == pending ]]; then
+    /bin/bash "$ROOT/network-backup/rollback.sh"
+  fi
   systemctl disable --now mmwx-cf-sync.timer mmwx-firewall.service
   rm -f /etc/systemd/system/docker.service.d/mmwx-firewall.conf
   while iptables -C DOCKER-USER -o br-mmwx-front -j MMWX-CF 2>/dev/null; do iptables -D DOCKER-USER -o br-mmwx-front -j MMWX-CF; done
   if iptables -nL MMWX-CF >/dev/null 2>&1; then iptables -F MMWX-CF; iptables -X MMWX-CF; fi
   ipset destroy mmwx_cf 2>/dev/null || true
-  while IFS= read -r cidr; do ufw delete allow from "$cidr" to any port 80,443 proto tcp; done < "$ROOT/cloudflare-v4.txt"
+  remove_legacy_cf_rules
   rm -f /etc/systemd/system/mmwx-firewall.service /etc/systemd/system/mmwx-cf-sync.{service,timer}
   systemctl daemon-reload
-  info "已卸载容器，数据保留于 $ROOT。运行 mmwx 选择恢复服务。"
+}
+purge_installation() {
+  [[ $ROOT == /opt/mmwx-installer && ! -L $ROOT && $(readlink -f "$ROOT") == /opt/mmwx-installer ]] || die '安装目录异常，停止删除。'
+  # A fixed project directory; never follow mounted filesystems during deletion.
+  rm -rf --one-file-system -- "$ROOT"
+  if [[ -L /usr/local/bin/mmwx && $(readlink /usr/local/bin/mmwx) == /usr/local/sbin/mmwx-installer ]]; then rm -f /usr/local/bin/mmwx; fi
+  rm -f /usr/local/sbin/mmwx-installer
+  if command -v docker >/dev/null; then
+    docker image rm mmwx-installer-caddy:2.11.4-cf0.2.4 >/dev/null 2>&1 || true
+  fi
+}
+uninstall_stack() {
+  [[ -d $ROOT ]] || die '未发现安装目录。'
+  [[ ! -f $ROOT/update.json ]] || die '请先恢复未完成的更新。'
+  [[ ! -f $ROOT/image-rollback.json ]] || die '请先继续未完成的版本回退。'
+  local mode
+  printf '1. 卸载并保留数据（默认）\n2. 完全卸载（删除数据、备份和 Token）\n'
+  mode=$(ask '选择 [1]：')
+  case "$mode" in
+    ''|1) mode=keep; confirm '卸载服务并保留数据？' || return 0;;
+    2) mode=purge; confirm "完全卸载并永久删除 $ROOT 中的数据、备份和 Token？" || return 0;;
+    *) die '无效选择。';;
+  esac
+  remove_services
+  if [[ $mode == purge ]]; then
+    purge_installation
+    info '已完全卸载本项目。Docker、系统网络/时区设置及 Cloudflare DNS 记录保留。'
+  else
+    info "已卸载容器，数据保留于 $ROOT。运行 mmwx 选择恢复服务。"
+  fi
 }
 usage() {
   cat <<'EOF'
@@ -738,11 +866,17 @@ resume_task() {
   install_command
   if [[ -f $ROOT/update.json ]]; then
     preflight; recover_update
+  elif [[ -f $ROOT/image-rollback.json ]]; then
+    preflight; finish_image_rollback
   elif [[ -f $ROOT/progress.json ]] && [[ $(jq -r .stage "$ROOT/progress.json") -lt 7 ]]; then
     install_stack
   else
     [[ -f $ROOT/state.json ]] || die '没有可恢复的任务，请从菜单选择安装。'
     preflight; load_state; install_units; network_is_ready || die '请检查 UFW/IPv6 配置后恢复。'
+    configure_timezone
+    render_compose > "$ROOT/compose.yaml.tmp"
+    mv "$ROOT/compose.yaml.tmp" "$ROOT/compose.yaml"
+    dc config --quiet
     sync_cf; dc up -d --wait --wait-timeout 300; verify_https
     info "已恢复：https://$DOMAIN"
   fi
@@ -756,21 +890,25 @@ menu() {
   [[ -z $ZONE_NAME ]] || arguments+=(--zone "$ZONE_NAME")
   [[ -z $CHANNEL ]] || arguments+=(--channel "$CHANNEL")
   while true; do
-    printf '\n妙妙屋 X\n1. 安装 / 继续安装\n2. 更新版本\n3. 状态\n4. 日志\n5. 继续任务 / 恢复服务\n6. 卸载（保留数据）\n7. 确认新 SSH 连接\n0. 退出\n'
+    printf '\n妙妙屋 X\n1. 安装 / 继续安装\n2. 更新版本\n3. 状态\n4. 日志\n5. 继续任务 / 恢复服务\n6. 卸载\n7. 确认新 SSH 连接\n8. 更新管理脚本\n9. 回退主控版本\n0. 退出\n'
     choice=$(ask '选择：')
     case "$choice" in
       1) action=install;; 2) action=update;; 3) action=status;; 4) action=logs;;
       5) action=resume;; 6) action=uninstall;;
       7) confirm '已通过 IPv4 重新登录成功？' || continue; action=confirm-network;;
+      8) action=self-update;; 9) action=rollback;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
     esac
-    if /bin/bash "$SELF" "$action" "${arguments[@]}"; then :; else info '操作未完成，可从菜单重试。'; fi
+    if /bin/bash "$SELF" "$action" "${arguments[@]}"; then
+      if [[ $action == self-update ]]; then exec /bin/bash /usr/local/sbin/mmwx-installer; fi
+    else info '操作未完成，可从菜单重试。'; fi
+    [[ -f $SELF ]] || return 0
   done
 }
 main() {
   while (($#)); do
     case "$1" in
-      install|update|uninstall|status|logs|resume|check|firewall-apply|firewall-sync|confirm-network) ACTION=$1; shift;;
+      install|update|uninstall|status|logs|resume|check|self-update|rollback|firewall-apply|firewall-sync|confirm-network) ACTION=$1; shift;;
       --yes) ACCEPT=1; shift;;
       --domain|--prefix|--zone|--channel|--cf-token-file)
         [[ $# -ge 2 ]] || die "缺少参数：$1"
@@ -780,7 +918,7 @@ main() {
   done
   [[ $EUID == 0 ]] || die '请用 sudo / root 运行。'
   if [[ -z $ACTION ]]; then menu; return; fi
-  case "$ACTION" in install|update|uninstall|resume) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  case "$ACTION" in install|update|uninstall|resume|self-update|rollback) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
   if [[ $ACTION == install && ! -f $ROOT/progress.json ]]; then
     printf '\033[1;31m仅限全新环境：启用 UFW、禁用 IPv6；请用 IPv4 SSH。\033[0m\n'
     if [[ $ACCEPT == 0 ]]; then confirm '开始安装？' || return 0; fi
@@ -789,6 +927,7 @@ main() {
     firewall-apply) exec 8>/run/mmwx-cf.lock; flock 8; apply_firewall;; firewall-sync) sync_cf;; confirm-network) confirm_network;;
     check) preflight; info '环境预检通过。';;
     install) install_stack;; update) update_stack;; uninstall) uninstall_stack;;
+    self-update) self_update;; rollback) rollback_stack;;
     status) load_state; dc ps; ufw status;; logs) load_state; dc logs --tail 80 caddy mmwx;;
     resume) resume_task;;
   esac

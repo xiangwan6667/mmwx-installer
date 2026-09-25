@@ -10,3 +10,12 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y shellcheck jq
       - run: bash -n install.sh && shellcheck install.sh tests/*.sh
       - run: sudo bash tests/test.sh && sudo bash tests/lifecycle.sh && sudo bash tests/resume.sh && sudo bash tests/update-resume.sh && sudo bash tests/dns.sh
+      - run: sudo bash tests/firewall-migration.sh && sudo bash tests/uninstall.sh && sudo bash tests/management.sh
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y ufw ipset jq
+      - run: sudo bash tests/persistence.sh
+      - run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT bash tests/firewall-live.sh

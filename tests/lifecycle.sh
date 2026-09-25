@@ -12,6 +12,7 @@ printf '{}' > "$ROOT/state.json"
 printf 'old-compose' > "$ROOT/compose.yaml"
 preflight() { :; }
 install_command() { :; }
+configure_timezone() { :; }
 load_state() { :; }
 choose_version() { VERSION=v1; }
 dc() { printf '%s\n' "$*" >> "$ROOT/operations"; }
