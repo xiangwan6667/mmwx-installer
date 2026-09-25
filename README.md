@@ -1,9 +1,14 @@
+<p align="center">
+  <img src="assets/MeowX.png" alt="MeowX 项目图标" width="180" height="180">
+</p>
+
 <h1 align="center">妙妙屋 X 安装器</h1>
 
 <div align="center">
 
 [![GitHub Release](https://img.shields.io/github/v/release/xiangwan6667/mmwx-installer?color=blue)](https://github.com/xiangwan6667/mmwx-installer/releases/latest)
 [![Installer checks](https://github.com/xiangwan6667/mmwx-installer/actions/workflows/check.yml/badge.svg)](https://github.com/xiangwan6667/mmwx-installer/actions/workflows/check.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 [快速开始](#快速开始) · [日常管理](#日常管理) · [数据与恢复](#数据与恢复) · [卸载](#卸载) · [常见问题](#常见问题)
 
@@ -151,3 +156,7 @@ Caddy 与 Cloudflare DNS 模块使用本仓库的 [预编译依赖包](https://g
 欢迎通过 [Issues](https://github.com/xiangwan6667/mmwx-installer/issues) 反馈问题，或提交 [Pull Request](https://github.com/xiangwan6667/mmwx-installer/pulls)。反馈时附上系统版本、架构、脚本版本及相关日志，并移除 Token、密码和业务信息。
 
 [查看发布记录](https://github.com/xiangwan6667/mmwx-installer/releases) · [查看自动检查](https://github.com/xiangwan6667/mmwx-installer/actions) · [妙妙屋 X 上游项目](https://github.com/iluobei/miaomiaowuX)
+
+## 许可证
+
+本安装器采用 [MIT License](LICENSE)。妙妙屋 X 及其他依赖遵循各自的许可证。
