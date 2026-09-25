@@ -8,10 +8,13 @@ source ./install.sh
 mkdir -m 700 "$ROOT"
 mkdir -p "$ROOT/config" "$ROOT/state"
 printf '173.245.48.0/20\n' > "$ROOT/state/cloudflare-v4.txt"
+baseline=$(mktemp -d)
 cleanup() {
+  if [[ -f $ROOT/config/compose.yaml ]]; then dc down --remove-orphans >/dev/null 2>&1 || true; fi
   docker rm -f mmwx-firewall-test >/dev/null 2>&1 || true
   docker network rm mmwx-firewall-test >/dev/null 2>&1 || true
   ip netns del mmwx-client 2>/dev/null || true
+  rm -rf "$baseline"
 }
 trap cleanup EXIT
 configure_timezone
@@ -29,6 +32,27 @@ ip netns exec mmwx-client ip route add default via 198.18.0.1
 ip route add 173.245.48.10/32 dev mmwx-host
 docker network create --opt com.docker.network.bridge.name=br-mmwx-front mmwx-firewall-test
 docker run -d --name mmwx-firewall-test --restart unless-stopped --network mmwx-firewall-test -p 80:80 -p 443:80 nginx:alpine
+# A real, active pre-install firewall and mixed interface state must survive a
+# complete uninstall. Keep independent expectations outside the purged ROOT.
+ufw default allow incoming
+ufw default allow outgoing
+ufw allow 24680/tcp comment preexisting-firewall-rule
+ufw --force enable
+sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+sysctl -w net.ipv6.conf.mmwx-host.disable_ipv6=1
+printf '# Existing administrator setting\nnet.ipv6.conf.lo.disable_ipv6=0\n' > /etc/sysctl.d/90-mmwx-ipv4-only.conf
+cp -a /etc/ufw "$baseline/ufw"
+cp -a /etc/default/ufw "$baseline/ufw-default"
+cp -a /etc/sysctl.d/90-mmwx-ipv4-only.conf "$baseline/ipv6.conf"
+ufw status verbose > "$baseline/ufw-status"
+for interface in all default lo mmwx-host; do
+  sysctl -n "net.ipv6.conf.$interface.disable_ipv6" > "$baseline/ipv6-$interface"
+done
+network_backup_capture
+printf 'confirmed\n' > "$ROOT/state/network-backup/state"
+printf 'net.ipv6.conf.all.disable_ipv6=1\nnet.ipv6.conf.default.disable_ipv6=1\nnet.ipv6.conf.lo.disable_ipv6=1\n' > /etc/sysctl.d/90-mmwx-ipv4-only.conf
+sysctl -p /etc/sysctl.d/90-mmwx-ipv4-only.conf
+sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp comment mmwx-ssh
@@ -99,4 +123,57 @@ PY
 cp ./install.sh /root/mmwx-install.sh
 uninstall_script
 [[ ! -e /root/mmwx-install.sh && ! -e /usr/local/bin/mmwx && ! -e /usr/local/sbin/mmwx-installer ]]
-echo 'PASS: only permitted sources reach Docker through ipset, including after UFW reload and Docker restart'
+# Full service removal must preserve the menu and remove every project-owned
+# container, including an orphan from a previous Compose configuration.
+install_command
+cat > "$ROOT/config/compose.yaml" <<'EOF'
+services:
+  mmwx:
+    image: nginx:alpine
+    command: [sleep, infinity]
+  postgres:
+    image: nginx:alpine
+    command: [sleep, infinity]
+  caddy:
+    image: nginx:alpine
+    command: [sleep, infinity]
+  orphan:
+    image: nginx:alpine
+    command: [sleep, infinity]
+EOF
+dc up -d --wait --wait-timeout 60
+[[ $(docker ps -aq --filter label=com.docker.compose.project=mmwx-installer | wc -l) == 4 ]]
+dc config --format json | jq 'del(.services.orphan)' > "$ROOT/config/compose.yaml.tmp"
+mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
+foreign_id=$(docker inspect --format '{{.Id}}' mmwx-firewall-test)
+foreign_started=$(docker inspect --format '{{.State.StartedAt}}' mmwx-firewall-test)
+ipset create mmwx_cf_next hash:net family inet -exist
+systemd-run --collect --unit=mmwx-network-rollback --on-active=15m /bin/true
+ask() { printf '2'; }
+uninstall_stack
+[[ ! -e $ROOT && ! -e /usr/local/lib/mmwx-installer/runtime.sh ]]
+[[ -z $(docker ps -aq --filter label=com.docker.compose.project=mmwx-installer) ]]
+[[ $(docker inspect --format '{{.Id}}' mmwx-firewall-test) == "$foreign_id" ]]
+[[ $(docker inspect --format '{{.State.StartedAt}}' mmwx-firewall-test) == "$foreign_started" ]]
+[[ $(docker inspect --format '{{.State.Running}}' mmwx-firewall-test) == true ]]
+[[ -x /usr/local/bin/mmwx && -x /usr/local/sbin/mmwx-installer ]]
+/usr/local/bin/mmwx --version
+for unit in mmwx-firewall.service mmwx-cf-sync.service mmwx-cf-sync.timer mmwx-network-rollback.service mmwx-network-rollback.timer; do
+  [[ ! -e /etc/systemd/system/$unit ]]
+  if systemctl is-active --quiet "$unit"; then die "Project unit remains active: $unit"; fi
+  if systemctl is-enabled --quiet "$unit"; then die "Project unit remains enabled: $unit"; fi
+done
+[[ ! -e /etc/systemd/system/docker.service.d/mmwx-firewall.conf ]]
+if systemctl cat docker.service | grep -Fq mmwx-installer; then die 'Docker retains the project startup hook'; fi
+if iptables -nL MMWX-CF >/dev/null 2>&1; then die 'Project firewall chain remains'; fi
+if iptables -S DOCKER-USER | grep -Fq MMWX-CF; then die 'Docker retains the project firewall jump'; fi
+if ipset list -name | grep -Eq '^mmwx_cf(_next)?$'; then die 'Project ipset remains'; fi
+diff -r "$baseline/ufw" /etc/ufw
+cmp "$baseline/ufw-default" /etc/default/ufw
+cmp "$baseline/ipv6.conf" /etc/sysctl.d/90-mmwx-ipv4-only.conf
+ufw status verbose > "$baseline/ufw-restored"
+cmp "$baseline/ufw-status" "$baseline/ufw-restored"
+for interface in all default lo mmwx-host; do
+  [[ $(sysctl -n "net.ipv6.conf.$interface.disable_ipv6") == "$(cat "$baseline/ipv6-$interface")" ]]
+done
+echo 'PASS: Docker Cloudflare filtering and full purge restore networking, remove project resources, and retain the manager and unrelated container'

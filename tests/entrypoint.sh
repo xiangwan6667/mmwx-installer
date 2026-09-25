@@ -42,4 +42,18 @@ cp ./install.sh "$tmp/mmwx-install.sh"
     echo 'Backend accepted extra management arguments'; exit 1
   fi
 )
+# The dedicated-host notice precedes consent and any installation work.
+(
+  # Only bypass root identity/host lock in this private fixture.
+  # shellcheck disable=SC2016
+  eval "$(declare -f main | sed 's|\$EUID|0|g; s|/run/mmwx-installer.lock|$ROOT/install.lock|g')"
+  SELF=$tmp/install.sh ACTION='' ACCEPT=0
+  flock() { :; }
+  confirm() { printf 'consent-boundary\n'; return 1; }
+  install_stack() { echo unexpected-install; }
+  main install > "$tmp/install-notice"
+)
+grep -q '专用服务器' "$tmp/install-notice"
+grep -q '无其他业务' "$tmp/install-notice"
+if grep -q unexpected-install "$tmp/install-notice"; then echo 'Install proceeded without consent'; exit 1; fi
 echo 'PASS: known downloaded copies removed; unrelated files retained; version header present'

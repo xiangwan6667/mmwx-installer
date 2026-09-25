@@ -12,7 +12,7 @@ ROOT=$host/opt/mmwx-installer
 # Exercise the actual deletion paths, with every host path confined to this fixture.
 for operation in remove_services purge_installation uninstall_script; do
   # shellcheck disable=SC2016
-  eval "$(declare -f "$operation" | sed 's|/opt/mmwx-installer|$host/opt/mmwx-installer|g; s|/usr/local/|$host/usr/local/|g; s|/etc/systemd/|$host/etc/systemd/|g; s|/run/mmwx-cf.lock|$host/cf.lock|g')"
+  eval "$(declare -f "$operation" | sed 's|/opt/mmwx-installer|$host/opt/mmwx-installer|g; s|/usr/local/|$host/usr/local/|g; s|/etc/systemd/|$host/etc/systemd/|g; s|/var/lib/systemd/|$host/var/lib/systemd/|g; s|/run/mmwx-cf.lock|$host/cf.lock|g')"
 done
 # Preserve the downloaded-script signature check while redirecting its fixed path.
 # shellcheck disable=SC2016
@@ -20,12 +20,14 @@ eval "$(declare -f cleanup_downloads | sed 's|/root/mmwx-install.sh|$host/root/m
 cd "$tmp"
 ask() { printf '%s' "$CHOICE"; }
 confirm() { printf '%s\n' "$1" >> "$tmp/prompts"; [[ $ANSWER == y ]]; }
-dc() { [[ $* == down ]] || return 1; printf 'removed\n' >> "$tmp/calls"; }
-systemctl() { case "$1" in show) echo not-found;; disable) return 42;; *) :;; esac; }
+dc() { [[ $* == 'down --remove-orphans' ]] || return 1; printf 'removed\n' >> "$tmp/calls"; }
+systemctl() { case "$1" in show) echo not-found;; is-active) return 3;; disable) return 42;; *) :;; esac; }
 flock() { :; }
 iptables() { return 1; }
 ipset() { return 1; }
 remove_legacy_cf_rules() { :; }
+network_restore_preflight() { echo checked >> "$tmp/network-calls"; [[ ${RESTORE_FAIL:-} != preflight ]]; }
+restore_install_network() { echo restored >> "$tmp/network-calls"; [[ ${RESTORE_FAIL:-} != restore ]]; }
 docker() { [[ $* == 'image rm mmwx-installer-caddy:2.11.4-cf0.2.4' ]]; }
 # Match the supported root execution while keeping all filesystem operations real.
 stat() { printf '0\n'; }
@@ -43,9 +45,11 @@ prepare_installation() {
   cp "$source_path" "$host/root/mmwx-install.sh"
   touch "$host/etc/systemd/system/docker.service.d/mmwx-firewall.conf" \
     "$host/etc/systemd/system/mmwx-firewall.service" \
-    "$host/etc/systemd/system/mmwx-cf-sync.service" "$host/etc/systemd/system/mmwx-cf-sync.timer"
+    "$host/etc/systemd/system/mmwx-cf-sync.service" "$host/etc/systemd/system/mmwx-cf-sync.timer" \
+    "$host/etc/systemd/system/mmwx-network-rollback.service" "$host/etc/systemd/system/mmwx-network-rollback.timer"
   SELF=$host/usr/local/sbin/mmwx-installer
   : > "$tmp/calls"
+  : > "$tmp/network-calls"
 }
 assert_manager_retained() {
   [[ -f $SELF && -x $SELF && -L $host/usr/local/bin/mmwx ]] || {
@@ -61,6 +65,7 @@ uninstall_stack > "$tmp/output"
 [[ $(cat "$tmp/calls") == removed && $(cat "$ROOT/sentinel") == data-to-keep ]]
 [[ ! -e $host/etc/systemd/system/mmwx-cf-sync.timer ]]
 assert_manager_retained
+[[ ! -s $tmp/network-calls ]]
 
 : > "$tmp/calls"
 CHOICE=2 ANSWER=n
@@ -69,14 +74,29 @@ uninstall_stack > "$tmp/output"
 assert_manager_retained
 
 CHOICE=2 ANSWER=y
+if (RESTORE_FAIL=preflight uninstall_stack) > "$tmp/output" 2>&1; then echo 'Missing network backup accepted'; exit 1; fi
+[[ ! -s $tmp/calls && -f $ROOT/sentinel ]]
+if (RESTORE_FAIL=restore uninstall_stack) > "$tmp/output" 2>&1; then echo 'Failed restoration accepted'; exit 1; fi
+[[ -f $ROOT/sentinel ]]
+assert_manager_retained
+: > "$tmp/calls"; : > "$tmp/network-calls"
 uninstall_stack > "$tmp/output"
 [[ $(cat "$tmp/calls") == removed && ! -e $ROOT ]]
+[[ $(cat "$tmp/network-calls") == $'checked\nrestored' ]]
+[[ ! -e $host/etc/systemd/system/mmwx-network-rollback.service && ! -e $host/etc/systemd/system/mmwx-network-rollback.timer ]]
 [[ ! -e $host/usr/local/lib/mmwx-installer/runtime.sh && ! -e $host/root/mmwx-install.sh ]]
 grep -q '永久删除' "$tmp/prompts"
 assert_manager_retained
 
 # The explicit script-only action remains the only way to remove the manager.
 prepare_installation
+# Cancelling a legacy-layout uninstall must not migrate or start anything.
+mv "$ROOT/config/compose.yaml" "$ROOT/compose.yaml"
+mv "$ROOT/state/state.json" "$ROOT/state.json"
+ensure_layout() { echo unexpected-migration >> "$tmp/calls"; return 1; }
+CHOICE=2 ANSWER=n
+uninstall_stack > "$tmp/output"
+[[ ! -s $tmp/calls && -f $ROOT/state.json && -f $ROOT/compose.yaml ]]
 rm -f "$host/etc/systemd/system/mmwx-cf-sync.timer" "$host/etc/systemd/system/docker.service.d/mmwx-firewall.conf"
 ANSWER=y
 uninstall_script > "$tmp/output"

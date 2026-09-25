@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.2.6
+SCRIPT_VERSION=0.2.7
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -670,6 +670,161 @@ sync_cf() (
     if [[ -n $(dc ps --status running -q caddy) ]]; then caddy_step '重载 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile; fi
   fi
 )
+network_backup_path() {
+  if [[ -e $ROOT/state/network-backup || -L $ROOT/state/network-backup ]]; then
+    [[ ! -e $ROOT/network-backup && ! -L $ROOT/network-backup ]] || die '发现两份网络备份，请先检查目录。'
+    printf '%s\n' "$ROOT/state/network-backup"
+  elif [[ -e $ROOT/network-backup || -L $ROOT/network-backup ]]; then
+    printf '%s\n' "$ROOT/network-backup"
+  else
+    printf '%s\n' "$ROOT/state/network-backup"
+  fi
+}
+network_backup_validate() {
+  local backup=$1 file value line interface special
+  local -A seen=()
+  [[ -d $backup && ! -L $backup && ! -L $ROOT && ! -L $ROOT/state ]] || die '网络备份目录异常，停止恢复。'
+  [[ -d $backup/ufw && ! -L $backup/ufw ]] || die '网络备份缺少 UFW 规则，停止恢复。'
+  special=$(find "$backup/ufw" ! -type f ! -type d -print -quit) || return 1
+  [[ -z $special ]] || die '网络备份包含异常规则文件，停止恢复。'
+  for file in ufw-default ufw-status ipv6-all ipv6-default ipv6-lo \
+    ufw/ufw.conf ufw/user.rules ufw/user6.rules ufw/before.rules ufw/before6.rules ufw/after.rules ufw/after6.rules; do
+    [[ -f $backup/$file && ! -L $backup/$file ]] || die "网络备份缺少 $file，停止恢复。"
+  done
+  value=$(cat "$backup/ufw-status") || return 1
+  [[ $value == 'Status: active' || $value == 'Status: inactive' ]] || die 'UFW 初始状态记录无效。'
+  for interface in all default lo; do
+    value=$(cat "$backup/ipv6-$interface") || return 1
+    [[ $value == 0 || $value == 1 ]] || die 'IPv6 初始状态记录无效。'
+  done
+  if [[ -e $backup/state || -L $backup/state ]]; then
+    [[ -f $backup/state && ! -L $backup/state ]] || die '网络恢复状态文件异常。'
+    value=$(cat "$backup/state") || return 1
+    case "$value" in pending|confirmed|rolled-back|restored) :;; *) die '网络恢复状态无效。';; esac
+  fi
+  if [[ -e $backup/format || -e $backup/ipv6-interfaces.tsv || -e $backup/sysctl-present || -L $backup/format || -L $backup/ipv6-interfaces.tsv || -L $backup/sysctl-present ]]; then
+    for file in format ipv6-interfaces.tsv sysctl-present; do
+      [[ -f $backup/$file && ! -L $backup/$file ]] || die '扩展网络备份不完整，停止恢复。'
+    done
+    [[ $(cat "$backup/format") == 2 ]] || die '网络备份版本不支持。'
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line =~ ^([a-zA-Z0-9_.:-]{1,15})$'\t'([01])$ ]] || die 'IPv6 网卡备份格式无效。'
+      interface=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+      [[ ! -v seen[$interface] ]] || die 'IPv6 网卡备份存在重复记录。'
+      seen[$interface]=$value
+    done < "$backup/ipv6-interfaces.tsv"
+    for interface in all default lo; do
+      [[ ${seen[$interface]:-missing} == "$(cat "$backup/ipv6-$interface")" ]] || die 'IPv6 网卡备份不完整或不一致。'
+    done
+    value=$(cat "$backup/sysctl-present") || return 1
+    case "$value" in
+      1) [[ -f $backup/sysctl-original && ! -L $backup/sysctl-original ]] || die '缺少原 IPv6 持久配置。';;
+      0) [[ ! -e $backup/sysctl-original && ! -L $backup/sysctl-original ]] || die 'IPv6 持久配置备份不一致。';;
+      *) die 'IPv6 持久配置记录无效。';;
+    esac
+  fi
+}
+network_backup_capture() (
+  local backup staged='' interface file value status
+  backup=$(network_backup_path) || return 1
+  if [[ -e $backup || -L $backup ]]; then network_backup_validate "$backup"; return $?; fi
+  [[ ! -L $ROOT && ! -L $ROOT/state ]] || die '安装状态目录不能是符号链接。'
+  mkdir -p "$ROOT/state" && chmod 700 "$ROOT/state" || return 1
+  staged=$(mktemp -d "$ROOT/state/.network-backup.XXXXXX") || return 1
+  trap '[[ -z ${staged:-} ]] || rm -rf -- "$staged"' EXIT
+  [[ -d /etc/ufw && ! -L /etc/ufw && -f /etc/default/ufw && ! -L /etc/default/ufw ]] || die 'UFW 配置文件异常，停止网络修改。'
+  cp -a /etc/ufw "$staged/ufw" || return 1
+  cp -a /etc/default/ufw "$staged/ufw-default" || return 1
+  status=$(LC_ALL=C ufw status) || return 1
+  printf '%s\n' "${status%%$'\n'*}" > "$staged/ufw-status" || return 1
+  : > "$staged/ipv6-interfaces.tsv" || return 1
+  for file in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [[ -f $file && ! -L $file ]] || die '无法读取 IPv6 网卡状态。'
+    interface=${file%/disable_ipv6}; interface=${interface##*/}
+    value=$(cat "$file") || return 1
+    printf '%s\t%s\n' "$interface" "$value" >> "$staged/ipv6-interfaces.tsv" || return 1
+    case "$interface" in all|default|lo) printf '%s\n' "$value" > "$staged/ipv6-$interface" || return 1;; esac
+  done
+  if [[ -e /etc/sysctl.d/90-mmwx-ipv4-only.conf || -L /etc/sysctl.d/90-mmwx-ipv4-only.conf ]]; then
+    [[ -f /etc/sysctl.d/90-mmwx-ipv4-only.conf && ! -L /etc/sysctl.d/90-mmwx-ipv4-only.conf ]] || die 'IPv6 持久配置文件异常，停止网络修改。'
+    cp -a /etc/sysctl.d/90-mmwx-ipv4-only.conf "$staged/sysctl-original" || return 1
+    printf '1\n' > "$staged/sysctl-present" || return 1
+  else
+    printf '0\n' > "$staged/sysctl-present" || return 1
+  fi
+  printf '2\n' > "$staged/format" || return 1
+  network_backup_validate "$staged" || return 1
+  mv -T "$staged" "$backup" || return 1
+  staged=''
+)
+network_restore_preflight() {
+  local backup progress stage
+  backup=$(network_backup_path) || return 1
+  if [[ -e $backup || -L $backup ]]; then network_backup_validate "$backup"; return $?; fi
+  if [[ -e $ROOT/state/state.json || -e $ROOT/state.json || -e $ROOT/state/cloudflare-v4.txt || -e $ROOT/cloudflare-v4.txt || \
+    -e /etc/sysctl.d/90-mmwx-ipv4-only.conf || -L /etc/sysctl.d/90-mmwx-ipv4-only.conf ]]; then
+    die '原网络备份缺失，无法安全恢复 UFW 和 IPv6；完整卸载已停止。'
+  fi
+  for progress in "$ROOT/state/progress.json" "$ROOT/progress.json"; do
+    [[ -f $progress ]] || continue
+    stage=$(jq -er '.stage | select(type=="number" and .>=0 and .<=7 and floor==.)' "$progress") || die '安装进度异常，无法确认原网络配置。'
+    [[ $stage -lt 6 ]] || die '安装已修改网络，但原网络备份缺失，停止完全卸载。'
+  done
+  return 0
+}
+restore_install_network() (
+  local backup interface value status expected file state_tmp=''
+  trap '[[ -z $state_tmp ]] || rm -f -- "$state_tmp"' EXIT
+  exec 9>/run/mmwx-network.lock || return 1
+  flock -w 180 9 || { info '网络设置正在变更，请稍后重试。'; return 1; }
+  network_restore_preflight || return 1
+  backup=$(network_backup_path) || return 1
+  [[ -d $backup ]] || return 0
+  [[ -d /etc/ufw && ! -L /etc/ufw && ! -L /etc/default/ufw && ! -L /etc/sysctl.d/90-mmwx-ipv4-only.conf ]] || die '系统网络配置路径异常，停止恢复。'
+  # Always repeat an interrupted restore from the untouched original snapshot.
+  ufw --force disable || return 1
+  find /etc/ufw -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || return 1
+  cp -a "$backup/ufw/." /etc/ufw/ || return 1
+  cp -a "$backup/ufw-default" /etc/default/ufw || return 1
+  if [[ -f $backup/sysctl-present && $(cat "$backup/sysctl-present") == 1 ]]; then
+    cp -a "$backup/sysctl-original" /etc/sysctl.d/90-mmwx-ipv4-only.conf || return 1
+  else
+    rm -f /etc/sysctl.d/90-mmwx-ipv4-only.conf || return 1
+  fi
+  expected=$(cat "$backup/ufw-status") || return 1
+  if [[ $expected == 'Status: active' ]]; then ufw --force enable || return 1; fi
+  # UFW may apply its own sysctls while enabling; restore runtime values last.
+  # Writing "all" changes existing interfaces: restore it before individual values.
+  for interface in all default lo; do
+    value=$(cat "$backup/ipv6-$interface") || return 1
+    sysctl -w "net/ipv6/conf/$interface/disable_ipv6=$value" || return 1
+  done
+  if [[ -f $backup/ipv6-interfaces.tsv ]]; then
+    while IFS=$'\t' read -r interface value; do
+      case "$interface" in all|default|lo) continue;; esac
+      file=/proc/sys/net/ipv6/conf/$interface/disable_ipv6
+      [[ -f $file ]] || continue
+      sysctl -w "net/ipv6/conf/$interface/disable_ipv6=$value" || return 1
+    done < "$backup/ipv6-interfaces.tsv"
+  else
+    info '旧版备份仅记录全局、默认和 lo 的 IPv6 状态；其他网卡恢复为原全局值。'
+  fi
+  status=$(LC_ALL=C ufw status) || return 1
+  [[ ${status%%$'\n'*} == "$expected" ]] || { info 'UFW 状态未恢复，已保留备份，请重试。'; return 1; }
+  for interface in all default lo; do
+    [[ $(cat "/proc/sys/net/ipv6/conf/$interface/disable_ipv6") == "$(cat "$backup/ipv6-$interface")" ]] || return 1
+  done
+  if [[ -f $backup/ipv6-interfaces.tsv ]]; then
+    while IFS=$'\t' read -r interface value; do
+      file=/proc/sys/net/ipv6/conf/$interface/disable_ipv6
+      [[ ! -f $file ]] || [[ $(cat "$file") == "$value" ]] || return 1
+    done < "$backup/ipv6-interfaces.tsv"
+  fi
+  state_tmp=$(mktemp "$backup/.state.XXXXXX") || return 1
+  printf 'restored\n' > "$state_tmp" || return 1
+  mv "$state_tmp" "$backup/state" || return 1
+  state_tmp=''
+)
 network_setup() {
   local port
   if [[ -f $ROOT/state/network-backup/state ]]; then
@@ -688,13 +843,7 @@ network_setup() {
   fi
   SSH_PORTS=$(ss -H -lntp | awk '/sshd/ {n=split($4,a,":"); print a[n]}' | sort -nu)
   [[ -n $SSH_PORTS ]] || die '无法识别 sshd 监听端口，停止网络修改。'
-  install -d "$ROOT/state/network-backup"
-  if [[ ! -f $ROOT/state/network-backup/ufw-status ]]; then
-    cp -a /etc/ufw "$ROOT/state/network-backup/ufw"
-    cp -a /etc/default/ufw "$ROOT/state/network-backup/ufw-default"
-    for port in all default lo; do sysctl -n "net.ipv6.conf.$port.disable_ipv6" > "$ROOT/state/network-backup/ipv6-$port"; done
-    ufw status | head -1 > "$ROOT/state/network-backup/ufw-status"
-  fi
+  network_backup_capture || die '无法保存安装前的网络配置，未修改网络。'
   fetch_cf "$ROOT/state/cloudflare-v4.txt" || die 'Cloudflare IP 列表获取失败。'
   install_units
   for port in $SSH_PORTS; do run_step "保留 SSH 端口 $port" ufw allow "$port/tcp" comment mmwx-ssh; done
@@ -1165,24 +1314,41 @@ rollback_stack() {
   finish_image_rollback
 }
 remove_services() {
-  if [[ -f $ROOT/config/compose.yaml ]]; then run_step '移除容器' dc down; fi
+  local unit
   systemctl stop mmwx-cf-sync.timer mmwx-cf-sync.service 2>/dev/null || true
   exec 8>/run/mmwx-cf.lock; flock -w 180 8 || die '防火墙正在更新，请稍后重试卸载。'
   systemctl stop mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
-  if [[ -f $ROOT/state/network-backup/state && $(cat "$ROOT/state/network-backup/state") == pending ]]; then
-    run_step '恢复原网络设置' /bin/bash "$ROOT/state/network-backup/rollback.sh"
-  fi
-  local unit
-  for unit in mmwx-cf-sync.timer mmwx-firewall.service; do
-    if [[ $(systemctl show --property=LoadState --value "$unit") != not-found ]]; then run_step "移除后台服务 $unit" systemctl disable --now "$unit"; fi
+  for unit in mmwx-network-rollback.timer mmwx-network-rollback.service; do
+    if systemctl is-active --quiet "$unit"; then die '网络回退任务仍在运行，停止卸载。'; fi
   done
+  for unit in mmwx-cf-sync.timer mmwx-cf-sync.service mmwx-firewall.service; do
+    if [[ $(systemctl show --property=LoadState --value "$unit") != not-found ]]; then
+      run_step "移除后台服务 $unit" systemctl disable --now "$unit" || return 1
+    fi
+  done
+  # Transient rollback units have no [Install] section; stop and reset them.
+  systemctl reset-failed mmwx-network-rollback.timer mmwx-network-rollback.service 2>/dev/null || true
   rm -f /etc/systemd/system/docker.service.d/mmwx-firewall.conf
-  while iptables -C DOCKER-USER -o br-mmwx-front -j MMWX-CF 2>/dev/null; do iptables -D DOCKER-USER -o br-mmwx-front -j MMWX-CF; done
-  if iptables -nL MMWX-CF >/dev/null 2>&1; then iptables -F MMWX-CF; iptables -X MMWX-CF; fi
-  ipset destroy mmwx_cf 2>/dev/null || true
-  remove_legacy_cf_rules
-  rm -f /etc/systemd/system/mmwx-firewall.service /etc/systemd/system/mmwx-cf-sync.{service,timer}
-  systemctl daemon-reload
+  rm -f /etc/systemd/system/mmwx-firewall.service /etc/systemd/system/mmwx-cf-sync.{service,timer} /etc/systemd/system/mmwx-network-rollback.{service,timer}
+  rm -f /var/lib/systemd/timers/stamp-mmwx-cf-sync.timer
+  systemctl daemon-reload || return 1
+  if [[ -f $ROOT/config/compose.yaml || -f $ROOT/compose.yaml ]]; then
+    run_step '移除项目容器' dc down --remove-orphans || return 1
+  fi
+  while iptables -C DOCKER-USER -o br-mmwx-front -j MMWX-CF 2>/dev/null; do iptables -D DOCKER-USER -o br-mmwx-front -j MMWX-CF || return 1; done
+  if iptables -nL MMWX-CF >/dev/null 2>&1; then
+    iptables -F MMWX-CF && iptables -X MMWX-CF || return 1
+  fi
+  local setname
+  for setname in mmwx_cf mmwx_cf_next; do
+    if ipset list "$setname" >/dev/null 2>&1; then ipset destroy "$setname" || return 1; fi
+  done
+  remove_legacy_cf_rules || return 1
+  local backup=$ROOT/state/network-backup
+  [[ -d $backup ]] || backup=$ROOT/network-backup
+  if [[ ${1:-keep} == keep && -f $backup/state && $(cat "$backup/state") == pending ]]; then
+    run_step '恢复未确认的网络设置' restore_install_network || return 1
+  fi
 }
 purge_installation() {
   [[ $ROOT == /opt/mmwx-installer && ! -L $ROOT && $(readlink -f "$ROOT") == /opt/mmwx-installer ]] || die '安装目录异常，停止删除。'
@@ -1198,22 +1364,26 @@ purge_installation() {
 uninstall_stack() {
   caddy_token_pending_guard
   [[ -d $ROOT ]] || die '未发现安装目录。'
-  ensure_layout
-  [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
-  [[ ! -f $ROOT/state/update.json ]] || die '请先恢复未完成的更新。'
-  [[ ! -f $ROOT/state/image-rollback.json ]] || die '请先继续未完成的版本回退。'
-  local mode
-  printf '1. 卸载并保留数据（默认）\n2. 完全卸载（删除数据、备份和 Token）\n'
+  # Uninstall reads the original layout directly; migration may start containers.
+  local mode state
+  for state in "$ROOT/state" "$ROOT"; do
+    [[ ! -f $state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
+    [[ ! -f $state/update.json ]] || die '请先恢复未完成的更新。'
+    [[ ! -f $state/image-rollback.json ]] || die '请先继续未完成的版本回退。'
+  done
+  printf '1. 卸载并保留数据（默认）\n2. 完全卸载（删除数据，恢复防火墙和 IPv6）\n'
   mode=$(ask '选择 [1]：')
   case "$mode" in
     ''|1) mode=keep; confirm '卸载服务并保留数据？' || return 0;;
-    2) mode=purge; confirm "完全卸载并永久删除 $ROOT 中的数据、备份和 Token？" || return 0;;
+    2) mode=purge; confirm "完全卸载并永久删除 $ROOT 中的数据、备份和 Token，同时恢复安装前的防火墙和 IPv6？" || return 0;;
     *) die '无效选择。';;
   esac
-  remove_services
+  if [[ $mode == purge ]]; then network_restore_preflight || die '网络备份不可用，停止卸载。'; fi
+  remove_services "$mode" || die '服务清理未完成，数据保留；请从菜单 10 重试。'
   if [[ $mode == purge ]]; then
+    run_step '恢复安装前的防火墙和 IPv6' restore_install_network || die '网络恢复失败，数据与备份保留；请从菜单 10 重试。'
     purge_installation
-    info '服务、数据、备份和 Token 已删除。mmwx 管理命令保留，可从菜单重新安装。Docker、系统网络/时区设置及 Cloudflare DNS 记录保留。'
+    info '项目容器、定时任务、后台脚本及数据已删除，防火墙和 IPv6 已恢复。mmwx 管理菜单、Docker、系统时区及 Cloudflare DNS 记录保留。'
   else
     info "已卸载容器，数据保留于 $ROOT。运行 mmwx 选择恢复服务。"
   fi
@@ -1771,7 +1941,7 @@ main() {
     caddy_refresh_runtime || die '后台程序更新失败，未修改 Caddy。';;
   esac
   if [[ $ACTION == install && ! -f $ROOT/state/progress.json ]]; then
-    printf '\033[1;31m仅限全新环境：启用 UFW、禁用 IPv6；请用 IPv4 SSH。\033[0m\n'
+    printf '\033[1;31m请使用专用服务器安装（全新 Debian / Ubuntu，无其他业务）。\n安装会启用 UFW、禁用 IPv6；请用 IPv4 SSH。\033[0m\n'
     if [[ $ACCEPT == 0 ]]; then confirm '开始安装？' || return 0; fi
   fi
   case "$ACTION" in
