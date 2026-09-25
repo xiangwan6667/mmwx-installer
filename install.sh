@@ -1613,6 +1613,7 @@ uninstall_stack() {
   remove_services "$mode" || die '服务清理未完成，数据保留；请从菜单 10 重试。'
   if [[ $mode == purge ]]; then
     run_step '清理 Docker、镜像、缓存和网络' purge_docker || die 'Docker 清理未完成，保留进度；请从菜单 10 重试完全卸载。'
+    hash -r
     run_step '恢复安装前的防火墙和 IPv6' restore_install_network || die '网络恢复失败，数据与备份保留；请从菜单 10 重试。'
     purge_installation
     info 'Docker、镜像、缓存、存储卷、虚拟网络及项目数据已删除，防火墙和 IPv6 已恢复。mmwx 管理菜单、系统时区及 Cloudflare DNS 记录保留。'
