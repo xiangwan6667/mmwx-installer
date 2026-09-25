@@ -60,7 +60,7 @@ printf 'candidate-token-value' > "$ROOT/state/caddy-token-change/candidate.token
 printf 'CF_API_TOKEN=candidate-env-token\n' > "$ROOT/state/caddy-token-change/candidate.env"
 (
   # This simulates verbose upstream Docker/Caddy errors at the external boundary.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   dc() { cat "$ROOT/config/cloudflare.token" "$ROOT/config/caddy.env" "$ROOT/state/caddy-token-change/"*; return 7; }
   (set -x; caddy_action logs) > "$tmp/log-output" 2>&1 && fail 'Failed logs reported success'
   (set -x; caddy_validate_config) > "$tmp/validate-output" 2>&1 && fail 'Failed validate reported success'
@@ -86,7 +86,7 @@ CHILD
 
 # A failed origin check must still report the edge and independent public HTTP status.
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   caddy_certificate_probe() { printf 'fixture %s\n' "$1"; [[ $1 == edge ]]; }
   curl() { printf '%s\n' "$*" > "$tmp/curl-call"; printf 503; }
   if caddy_action certificates > "$tmp/certificates"; then fail 'Failed origin probe reported success'; fi

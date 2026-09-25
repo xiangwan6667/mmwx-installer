@@ -120,7 +120,7 @@ trap 'printf "Token boundary test failed at line %s\n" "$LINENO" >&2' ERR
   printf '%s\n' "$new" > "$ROOT/state/caddy-token-change/candidate.token"
   printf '{"type":"TXT","name":"_probe.example.com","content":"test"}\n' > "$ROOT/payload.json"
   : > "$tmp/curl.calls"
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   curl() {
     local arg header='' output='' payload=''
     printf 'request\n' >> "$tmp/curl.calls"
@@ -194,9 +194,9 @@ chmod 600 "$TOKEN_FILE"
 : > "$tmp/stage-writes"; : > "$tmp/api.calls"; : > "$tmp/docker.calls"
 if (
   # Both commands are called indirectly by caddy_token_stage.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   mktemp() { return 1; }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   cp() { printf 'copy attempted\n' >> "$tmp/stage-writes"; return 96; }
   replace_caddy_token
 ) > "$tmp/output" 2>&1; then echo 'Failed private staging accepted'; exit 1; fi
@@ -213,9 +213,9 @@ assert_old
   confirm() { return 0; }
   caddy_token_probe() { printf 'API attempted\n' >> "$tmp/guard.calls"; return 1; }
   # Unexpected indirect calls are recorded, rather than changing the host.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   dc() { printf 'container attempted\n' >> "$tmp/guard.calls"; return 1; }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   ensure_layout() { printf 'migration attempted\n' >> "$tmp/guard.calls"; return 1; }
   printf '{}\n' > "$ROOT/config/compose.yaml"
   printf ':80 {}\n' > "$ROOT/config/Caddyfile"

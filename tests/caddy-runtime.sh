@@ -49,13 +49,23 @@ $DOMAIN {
 }
 EOF
 render_compose > "$ROOT/original.yaml"
-docker compose -f "$ROOT/original.yaml" config --no-env-resolution --format json | jq '
+# Compose config discards env_file entries even with --no-env-resolution on
+# some versions. Restore the known paths so every recreation reads live files.
+docker compose -f "$ROOT/original.yaml" config --no-env-resolution --format json | jq --arg root "$ROOT" '
   .services.caddy.ports=[{target:443,published:"443",host_ip:"127.0.0.1",protocol:"tcp"}] |
   .services.caddy.depends_on.mmwx.condition="service_started" |
-  del(.services.caddy.environment.CF_API_TOKEN) |
+  del(.services.caddy.environment.CF_API_TOKEN,
+      .services.mmwx.environment.MMWX_DATABASE_PASSWORD,
+      .services.postgres.environment.POSTGRES_PASSWORD) |
+  .services.caddy.env_file=[$root+"/config/caddy.env"] |
+  .services.mmwx.env_file=[$root+"/config/app.env"] |
+  .services.postgres.env_file=[$root+"/config/postgres.env"] |
   .services.mmwx.command=["sleep","infinity"] | del(.services.mmwx.healthcheck)
 ' > "$ROOT/config/compose.yaml"
-jq -e '.services.caddy.env_file | length > 0' "$ROOT/config/compose.yaml" >/dev/null
+jq -e --arg root "$ROOT" '.services.caddy.env_file==[$root+"/config/caddy.env"] and
+  .services.mmwx.env_file==[$root+"/config/app.env"] and
+  .services.postgres.env_file==[$root+"/config/postgres.env"] and
+  .services.caddy.environment.CF_API_TOKEN==null' "$ROOT/config/compose.yaml" >/dev/null
 save_state
 checkpoint 7
 compose up -d --wait --wait-timeout 120
