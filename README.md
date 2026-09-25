@@ -16,9 +16,12 @@
 
 ## 安装
 
+以 root 用户执行（首次运行会安装下载依赖）：
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xiangwan6667/mmwx-installer/main/install.sh -o mmwx-install.sh
-sudo bash mmwx-install.sh
+apt-get update && apt-get install -y ca-certificates curl && \
+curl -fsSL https://raw.githubusercontent.com/xiangwan6667/mmwx-installer/main/install.sh -o mmwx-install.sh && \
+bash mmwx-install.sh
 ```
 
 选择 **1**，按提示输入 Token、选择主域名和版本。子域名前缀默认 `mmwx`，回车即可；DNS 记录和小黄云由脚本创建。同名记录冲突时停止，不覆盖已有配置。
