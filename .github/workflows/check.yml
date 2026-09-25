@@ -9,4 +9,4 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y shellcheck jq
       - run: bash -n install.sh && shellcheck install.sh tests/*.sh
-      - run: sudo bash tests/test.sh && sudo bash tests/lifecycle.sh
+      - run: sudo bash tests/test.sh && sudo bash tests/lifecycle.sh && sudo bash tests/resume.sh && sudo bash tests/update-resume.sh && sudo bash tests/dns.sh

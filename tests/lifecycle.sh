@@ -11,6 +11,7 @@ if (confirm_network) 2>/dev/null; then echo 'Expired network confirmation accept
 printf '{}' > "$ROOT/state.json"
 printf 'old-compose' > "$ROOT/compose.yaml"
 preflight() { :; }
+install_command() { :; }
 load_state() { :; }
 choose_version() { VERSION=v1; }
 dc() { printf '%s\n' "$*" >> "$ROOT/operations"; }
