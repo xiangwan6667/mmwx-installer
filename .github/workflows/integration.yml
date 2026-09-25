@@ -17,6 +17,4 @@ jobs:
         run: sudo bash -c 'source ./install.sh; build_caddy'
       - name: Stable and Beta PostgreSQL bridge smoke test
         run: |
-          sudo systemctl set-property --runtime mmwx-test.slice CPUQuota=100%
-          sudo systemctl start mmwx-test.slice
           sudo env SMOKE_RELEASES_FILE=/tmp/mmwx-releases.json bash tests/smoke.sh
