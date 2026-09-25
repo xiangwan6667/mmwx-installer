@@ -193,7 +193,7 @@ EOF
 choose_version() {
   local pages='[]' page result selected
   for page in $(seq 1 20); do
-    result=$(get "https://api.github.com/repos/$UPSTREAM/releases?per_page=100&page=$page") || die 'GitHub 版本查询失败，请稍后重试。'
+    result=$(get "https://api.github.com/repos/$UPSTREAM/releases?per_page=100&page=$page") || die 'GitHub 版本查询失败，可能是匿名 API 限流（每小时 60 次）或网络错误。请稍后重试；不会使用缓存版本或 latest。'
     jq -e 'type == "array"' <<<"$result" >/dev/null || die 'GitHub 返回异常。'
     pages=$(jq -cs '.[0]+.[1]' <(printf '%s' "$pages") <(printf '%s' "$result"))
     [[ $(jq length <<<"$result") -eq 100 ]] || break
@@ -227,7 +227,10 @@ dns_check() {
   headers=$(mktemp); printf 'Authorization: Bearer %s\n' "$token" > "$headers"
   zone=$(get -H "@$headers" 'https://api.cloudflare.com/client/v4/zones?status=active&per_page=50' | jq -er --arg domain "$DOMAIN" '[.result[] | .name as $zone | select($domain == $zone or ($domain | endswith("."+$zone)))] | sort_by(.name|length) | last.id // empty') || { rm -f "$headers"; die '无法读取域名区域，请检查 Zone Read 权限和区域授权。'; }
   records=$(get -H "@$headers" "https://api.cloudflare.com/client/v4/zones/$zone/dns_records?name=$DOMAIN") || { rm -f "$headers"; die 'DNS 查询失败。'; }
-  ipv4=$(get https://api4.ipify.org)
+  ipv4=$(ip -j -4 address show scope global | python3 -c 'import sys,json,ipaddress
+addresses=[a["local"] for i in json.load(sys.stdin) for a in i.get("addr_info",[]) if ipaddress.ip_address(a["local"]).is_global]
+if len(addresses)!=1: sys.exit("需要唯一的网卡公网 IPv4；多地址或 NAT 主机请先确认网络配置。")
+print(addresses[0])') || { rm -f "$headers"; die '无法安全确定源站 IPv4。'; }
   python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); assert a.version==4 and a.is_global' "$ipv4"
   jq -e '.success==true and (.result|type)=="array"' <<<"$records" >/dev/null || { rm -f "$headers"; die 'Cloudflare DNS 查询未成功。'; }
   operation=$(dns_record_action "$ipv4" <<<"$records") || { rm -f "$headers"; die "域名 $DOMAIN 已有冲突记录，未覆盖。请在 https://dash.cloudflare.com/ 检查同名 A/AAAA/CNAME 记录。"; }

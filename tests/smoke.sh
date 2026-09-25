@@ -3,6 +3,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source ./install.sh
+# Optional local retrieval snapshot for a rate-limited test host; production does not use it.
+if [[ -n ${SMOKE_RELEASES_FILE:-} ]]; then
+  get() {
+    case "$1" in https://api.github.com/repos/*/releases\?*) cat "$SMOKE_RELEASES_FILE";; *) curl -fsSL "$@";; esac
+  }
+fi
 ROOT=/root/mmwx-installer-smoke
 [[ ! -e $ROOT ]] || die 'Smoke directory already exists; inspect it before retrying.'
 mkdir -m 700 "$ROOT"
