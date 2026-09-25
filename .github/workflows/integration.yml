@@ -1,0 +1,22 @@
+name: Docker integration
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare latest official release snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api 'repos/iluobei/miaomiaowuX/releases?per_page=100' --jq '[.[] | {tag_name,prerelease,draft,published_at}]' > /tmp/mmwx-releases.json
+      - name: Assemble Caddy from precompiled binary
+        run: sudo bash -c 'source ./install.sh; build_caddy'
+      - name: Stable and Beta PostgreSQL bridge smoke test
+        run: |
+          sudo systemctl set-property --runtime mmwx-test.slice CPUQuota=100%
+          sudo systemctl start mmwx-test.slice
+          sudo env SMOKE_RELEASES_FILE=/tmp/mmwx-releases.json bash tests/smoke.sh
