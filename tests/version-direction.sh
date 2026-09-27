@@ -60,11 +60,15 @@ cross='[{"tag_name":"v2.0.0","draft":false,"prerelease":false,"published_at":"20
 fetch_releases() { printf '%s' "$cross"; }
 check_app_image() { return 0; }
 CHANNEL=stable CHANNEL_EXPLICIT=1 ACCEPT=0
+# This is the sourced chooser; the later override isolates the final guard tests.
+# shellcheck disable=SC2218
 choose_version update v2.0.0-beta.2 >/dev/null
 [[ $VERSION == v2.0.0 ]]
 CHANNEL=beta
+# shellcheck disable=SC2218
 choose_version update v2.0.0 >/dev/null
 [[ $VERSION == v2.1.0-beta.1 ]]
+# shellcheck disable=SC2218
 choose_version rollback v2.0.0 >/dev/null
 [[ $VERSION == v2.0.0-beta.10 ]]
 # Reselecting an empty channel cancels without checking or pulling an invalid candidate.
