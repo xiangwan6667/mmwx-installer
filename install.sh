@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.3.0
+SCRIPT_VERSION=0.3.1
 SCRIPT_UPDATE_CHECKED=0 SCRIPT_UPDATE_VERSION=''
 CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
@@ -232,11 +232,56 @@ ensure_layout() {
 valid_domain() {
   [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ && ${#1} -le 253 ]]
 }
+version_rules() {
+  python3 -c 'import sys,re,json
+def parse(tag):
+    m=re.fullmatch(r"v?(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?(?:\.(0|[1-9][0-9]*))?(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",tag or "")
+    if not m: raise ValueError()
+    pre=m[4]
+    ids=[]
+    if pre:
+        for x in pre.split("."):
+            if x.isdigit():
+                if len(x)>1 and x[0]=="0": raise ValueError()
+                ids.append((0,int(x)))
+            else: ids.append((1,x))
+    return (tuple(int(m[i] or 0) for i in (1,2,3)), 0 if pre else 1, tuple(ids))
+mode,operation,current=sys.argv[1:4]
+if operation not in ("install","update","rollback"): sys.exit("未知版本操作。")
+try: baseline=parse(current) if operation!="install" else None
+except ValueError: sys.exit("当前版本号无效，停止版本操作。")
+def eligible(tag):
+    target=parse(tag)
+    return operation=="install" or (target>baseline if operation=="update" else target<baseline)
+if mode=="check":
+    try: ok=eligible(sys.argv[4])
+    except ValueError: ok=False
+    sys.exit(0 if ok else 1)
+channel=sys.argv[4]
+rows=[]; seen=set()
+for row in json.load(sys.stdin):
+    if row.get("draft") is not False or not row.get("published_at") or row.get("prerelease") != (channel=="beta"): continue
+    tag=row.get("tag_name")
+    try: ok=eligible(tag)
+    except (ValueError,TypeError):
+        print("跳过无效版本号："+str(tag),file=sys.stderr); continue
+    if ok and tag not in seen: rows.append(row); seen.add(tag)
+rows.sort(key=lambda r:r["published_at"],reverse=True)
+print(json.dumps(rows[:5]))' "$@"
+}
+version_allowed() { version_rules check "$1" "$2" "$3"; }
 select_release() {
-  jq -ce --arg channel "$1" '[.[] | select(.draft == false and (.prerelease == ($channel == "beta"))) | select(.published_at != null)] | sort_by(.published_at) | last | select(. != null)'
+  recent_releases "$@" | jq -ce '.[0] | select(. != null)'
 }
 recent_releases() {
-  jq -ce --arg channel "$1" '[.[] | select(.draft == false and .published_at != null and (.prerelease == ($channel == "beta")))] | unique_by(.tag_name) | sort_by(.published_at) | reverse | .[:5]'
+  version_rules filter "${2:-install}" "${3:-}" "$1"
+}
+release_channels_ready() {
+  local rows=$1 count=$2 operation=$3 current=$4 channel recent
+  for channel in stable beta; do
+    recent=$(recent_releases "$channel" "$operation" "$current" <<<"$rows") || return 1
+    [[ $(jq length <<<"$recent") -ge $count ]] || return 1
+  done
 }
 parse_release_html() {
   python3 -c 'import sys,re,json,html
@@ -256,7 +301,7 @@ if not rows: sys.exit("Unrecognized GitHub release page")
 print(json.dumps(rows))'
 }
 fetch_releases_web() {
-  local rows='[]' page html parsed count=${1:-1}
+  local rows='[]' page html parsed count=${1:-1} operation=${2:-install} current=${3:-}
   html=$(get "https://github.com/$UPSTREAM/releases/latest") || return 1
   parsed=$(parse_release_html <<<"$html") || return 1
   rows=$parsed
@@ -264,21 +309,24 @@ fetch_releases_web() {
     html=$(get "https://github.com/$UPSTREAM/releases?page=$page") || return 1
     parsed=$(parse_release_html <<<"$html") || return 1
     rows=$(printf '%s\n%s\n' "$rows" "$parsed" | jq -cs 'add | unique_by(.tag_name)')
-    if jq -e --argjson count "$count" '([.[]|select(.prerelease==true)]|length)>=$count and ([.[]|select(.prerelease==false)]|length)>=$count' <<<"$rows" >/dev/null; then break; fi
+    if release_channels_ready "$rows" "$count" "$operation" "$current"; then break; fi
     [[ $html == *'rel="next"'* || $html == *'>Next<'* ]] || break
+    if [[ $page == 10 ]]; then printf '版本页面达到查询上限，结果可能不完整。\n' >&2; fi
   done
   printf '%s\n' "$rows"
 }
 fetch_releases() {
-  local rows='[]' page result
+  local rows='[]' page result count=${1:-1} operation=${2:-install} current=${3:-}
   for page in $(seq 1 20); do
     if ! result=$(get "https://api.github.com/repos/$UPSTREAM/releases?per_page=100&page=$page" 2>/dev/null) || ! jq -e 'type == "array"' <<<"$result" >/dev/null 2>&1; then
       printf '版本 API 暂不可用，改用官方发布页面。\n' >&2
-      fetch_releases_web "${1:-1}"
+      fetch_releases_web "$count" "$operation" "$current"
       return
     fi
     rows=$(printf '%s\n%s\n' "$rows" "$result" | jq -cs 'add')
+    if release_channels_ready "$rows" "$count" "$operation" "$current"; then break; fi
     [[ $(jq length <<<"$result") -eq 100 ]] || break
+    if [[ $page == 20 ]]; then printf '版本 API 达到查询上限，结果可能不完整。\n' >&2; fi
   done
   printf '%s\n' "$rows"
 }
@@ -500,16 +548,16 @@ EOF
 }
 channel_name() { if [[ $1 == beta ]]; then printf '测试版'; else printf '正式版'; fi; }
 select_version_menu() {
-  local pages=$1 recent number count selected
+  local pages=$1 operation=${2:-install} current=${3:-} recent number count selected
   section '指定版本'
   printf '  1  正式版
   2  测试版（Beta）
 '
   number=$(ask '选择通道 [1]：') || die '无法读取通道选择。'
   case "$number" in ''|1) CHANNEL=stable;; 2) CHANNEL=beta;; *) die '无效通道。';; esac
-  recent=$(recent_releases "$CHANNEL" <<<"$pages")
+  recent=$(recent_releases "$CHANNEL" "$operation" "$current" <<<"$pages") || return 1
   count=$(jq length <<<"$recent")
-  [[ $count -gt 0 ]] || die "没有可用的$(channel_name "$CHANNEL")。"
+  [[ $count -gt 0 ]] || { info "没有符合方向的$(channel_name "$CHANNEL")版本，无需切换。"; return 1; }
   printf '
   最近 %s 个%s
 ' "$count" "$(channel_name "$CHANNEL")"
@@ -590,15 +638,16 @@ pull_app_version() {
   APP_IMAGE=$(docker image inspect "$APP_IMAGE" --format '{{index .RepoDigests 0}}') || die '读取主控镜像摘要失败，未切换版本。'
 }
 choose_version() {
-  local pages selected mode choice=''
-  pages=$(fetch_releases 5) || die '无法读取官方版本，请检查 GitHub 网络连接后用 mmwx 继续。'
+  local operation=${1:-install} current=${2:-} pages selected mode choice=''
+  recent_releases stable "$operation" "$current" <<<'[]' >/dev/null || die '当前版本号无效。'
+  pages=$(fetch_releases 5 "$operation" "$current") || die '无法读取官方版本，请检查 GitHub 网络连接后用 mmwx 继续。'
   section '主控版本'
   for mode in stable beta; do
-    selected=$(select_release "$mode" <<<"$pages") || selected=null
+    selected=$(select_release "$mode" "$operation" "$current" <<<"$pages") || selected=null
     printf '  %s  %s
 ' "$(channel_name "$mode")" "$(jq -r 'if .==null then "暂无" else .tag_name end' <<<"$selected")"
   done
-  if [[ -z $CHANNEL || ( $ACTION == update && $CHANNEL_EXPLICIT == 0 && $ACCEPT == 0 ) ]]; then
+  if [[ -z $CHANNEL || ( $operation == update && $CHANNEL_EXPLICIT == 0 && $ACCEPT == 0 ) ]]; then
     printf '
   1  最新正式版
   2  最新测试版
@@ -607,20 +656,21 @@ choose_version() {
     choice=$(ask "选择 [回车沿用$(channel_name "${CHANNEL:-stable}")]：") || die '无法读取版本选择。'
     case "$choice" in
       '') CHANNEL=${CHANNEL:-stable};; 1) CHANNEL=stable;; 2) CHANNEL=beta;;
-      3) select_version_menu "$pages";; *) die '无效选择。';;
+      3) select_version_menu "$pages" "$operation" "$current" || return 1;; *) die '无效选择。';;
     esac
   fi
   [[ $CHANNEL == stable || $CHANNEL == beta ]] || die 'channel 只能是 stable 或 beta。'
   if [[ $choice != 3 ]]; then
-    selected=$(select_release "$CHANNEL" <<<"$pages") || die '所选通道没有可用版本。'
+    selected=$(select_release "$CHANNEL" "$operation" "$current" <<<"$pages") || { info '没有符合方向的版本，无需更新或回退。'; return 1; }
     VERSION=$(jq -r .tag_name <<<"$selected")
   fi
   if [[ $choice == 3 ]]; then
-    select_available_image "$pages" specified || return 1
+    select_available_image "$pages" specified "$operation" "$current" || return 1
   else
-    select_available_image "$pages" latest || return 1
+    select_available_image "$pages" latest "$operation" "$current" || return 1
   fi
-  pull_app_version
+  version_allowed "$operation" "$current" "$VERSION" || return 1
+  if [[ $operation == install ]]; then pull_app_version; fi
 }
 
 image_unavailable_notice() {
@@ -631,8 +681,9 @@ image_unavailable_notice() {
   esac
 }
 select_available_image() {
-  local pages=$1 mode=$2 status candidate choice
+  local pages=$1 mode=$2 operation=${3:-install} current=${4:-} status candidate choice
   while true; do
+    version_allowed "$operation" "$current" "$VERSION" || return 1
     info "检查主控 $VERSION 镜像……"
     if check_app_image "$VERSION"; then return 0; else status=$?; fi
     image_unavailable_notice "$VERSION" "$status"
@@ -641,7 +692,7 @@ select_available_image() {
       choice=$(ask '选择 [0]：') || die '无法读取版本选择。'
       case "$choice" in
         1) continue;;
-        2) select_version_menu "$pages"; continue;;
+        2) select_version_menu "$pages" "$operation" "$current" || return 1; continue;;
         ''|0) info '已取消版本选择。'; return 1;;
         *) die '无效选择。';;
       esac
@@ -658,8 +709,9 @@ select_available_image() {
         return 1
       else status=$?; fi
       image_unavailable_notice "$candidate" "$status"
-    done < <(recent_releases "$CHANNEL" <<<"$pages" | jq -r '.[1:][].tag_name')
-    die '该通道最近版本均无适合本机的镜像，请稍后重试或指定其他通道。'
+    done < <(recent_releases "$CHANNEL" "$operation" "$current" <<<"$pages" | jq -r '.[1:][].tag_name')
+    info '该通道符合方向的最近版本均无适合本机的镜像，无需更新或回退。'
+    return 1
   done
 }
 
@@ -1251,7 +1303,91 @@ prepare_secrets() {
     mv "$ROOT/config/caddy.env.tmp" "$ROOT/config/caddy.env"
   fi
 }
+installation_status() {
+  # Read both layouts without migration or Docker calls. State is saved before
+  # the final HTTPS check, so a valid unfinished checkpoint takes precedence.
+  local state='' progress='' stage='' path entry
+  INSTALL_STATUS=blocked INSTALL_STATUS_REASON='安装记录异常，请检查记录后通过菜单 5 恢复。'
+  for path in "$ROOT" "$ROOT/state" "$ROOT/config" "$ROOT/data" "$ROOT/certs" "$ROOT/backups"; do
+    if [[ -L $path || ( -e $path && ! -d $path ) ]]; then
+      INSTALL_STATUS_REASON='安装目录异常，请检查路径后重试。'; return
+    fi
+  done
+  if [[ -e $ROOT/.layout-migration || -L $ROOT/.layout-migration ]]; then
+    INSTALL_STATUS_REASON='目录迁移尚未完成，请先通过菜单 5 恢复。'; return
+  fi
+  for path in "$ROOT/state/state.json" "$ROOT/state/progress.json" "$ROOT/state.json" "$ROOT/progress.json"; do
+    [[ ! -e $path && ! -L $path ]] && continue
+    [[ -f $path && ! -L $path ]] || return 0
+    command -v jq >/dev/null || { INSTALL_STATUS_REASON='缺少 jq，无法确认已有安装记录，请先恢复依赖。'; return; }
+    if [[ ${path##*/} == state.json ]]; then
+      [[ -z $state ]] || return 0
+      state=$path
+      jq -e 'type=="object" and all(.domain,.version,.app,.caddy,.pg; type=="string" and length>0) and (.channel=="stable" or .channel=="beta")' "$state" >/dev/null 2>&1 || return 0
+    else
+      [[ -z $progress ]] || return 0
+      progress=$path
+      jq -e 'type=="object" and (.stage|type=="number" and .>=0 and .<=7 and .==floor)' "$progress" >/dev/null 2>&1 || return 0
+      stage=$(jq -r .stage "$progress") || return 0
+      if ((stage>=2)); then jq -e '.domain|type=="string" and length>0' "$progress" >/dev/null 2>&1 || return 0; fi
+      if ((stage>=3)); then
+        jq -e 'all(.version,.app; type=="string" and length>0) and (.channel=="stable" or .channel=="beta")' "$progress" >/dev/null 2>&1 || return 0
+      fi
+      if ((stage>=4)); then jq -e 'all(.caddy,.pg; type=="string" and length>0)' "$progress" >/dev/null 2>&1 || return 0; fi
+    fi
+  done
+  if [[ -n $state && -n $progress && ${state%/*} != "${progress%/*}" ]]; then return; fi
+  if [[ -n $progress && $stage -lt 7 ]]; then
+    if [[ $stage == 6 && -z $state ]]; then return; fi
+    if [[ -n $state ]]; then
+      ((stage>=5)) || return 0
+      jq -es '.[0] as $state | .[1] as $progress | all(["domain","channel","version","app","caddy","pg"][]; $state[.] == $progress[.])' "$state" "$progress" >/dev/null 2>&1 || return 0
+    fi
+    INSTALL_STATUS=incomplete INSTALL_STATUS_REASON=''; return
+  fi
+  if [[ -n $state ]]; then
+    INSTALL_STATUS=installed INSTALL_STATUS_REASON='已安装，请使用 2 更新、5 恢复或 7 重装。'; return
+  fi
+  [[ -z $progress ]] || return 0
+  for path in "$ROOT/config" "$ROOT/data" "$ROOT/certs" "$ROOT/backups" \
+    "$ROOT/postgres-data" "$ROOT/subscribes" "$ROOT/rule_templates" "$ROOT/caddy-data" "$ROOT/caddy-config" \
+    "$ROOT/.legacy-app" "$ROOT/state/network-backup" "$ROOT/network-backup"; do
+    [[ ! -L $path ]] || return 0
+    if [[ -d $path ]]; then
+      entry=$(find "$path" -mindepth 1 -print -quit) || return 0
+      [[ -z $entry ]] || { INSTALL_STATUS_REASON='发现遗留配置或数据，无法确认安装状态，请检查后通过菜单 5 恢复。'; return; }
+    elif [[ -e $path ]]; then return 0; fi
+  done
+  for path in compose.yaml Caddyfile postgres.env app.env caddy.env cloudflare.token; do
+    if [[ -e $ROOT/$path || -L $ROOT/$path ]]; then
+      INSTALL_STATUS_REASON='发现旧版配置但缺少安装记录，请检查后通过菜单 5 恢复。'; return
+    fi
+  done
+  if [[ -d $ROOT ]]; then
+    entry=$(find "$ROOT" -mindepth 1 -maxdepth 1 ! -name config ! -name data ! -name certs ! -name backups ! -name state -print -quit) || return 0
+    [[ -z $entry ]] || { INSTALL_STATUS_REASON='发现遗留文件但缺少安装记录，请检查后通过菜单 5 恢复。'; return; }
+  fi
+  if [[ -d $ROOT/state ]]; then
+    entry=$(find "$ROOT/state" -mindepth 1 -maxdepth 1 ! -name logs -print -quit) || return 0
+    [[ -z $entry ]] || return 0
+  fi
+  INSTALL_STATUS=fresh INSTALL_STATUS_REASON=''
+}
+install_entry_guard() {
+  local directory task
+  for directory in "$ROOT/state" "$ROOT"; do
+    for task in update.json image-rollback.json reinstall.json caddy-token-change caddy-domain-change docker-purge.json; do
+      if [[ -e $directory/$task || -L $directory/$task ]]; then
+        if [[ $task == docker-purge.json ]]; then die '完全卸载尚未完成，请从菜单 10 继续。'; fi
+        die '有未完成的维护任务，请先通过菜单 5 恢复。'
+      fi
+    done
+  done
+  installation_status
+  case "$INSTALL_STATUS" in fresh|incomplete) return 0;; *) die "$INSTALL_STATUS_REASON";; esac
+}
 install_stack() {
+  install_entry_guard
   caddy_token_pending_guard
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
@@ -1373,18 +1509,17 @@ update_stack() {
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight
-  install_command
-  if [[ -f $ROOT/state/update.json ]]; then recover_update; return; fi
-  [[ ! -f $ROOT/state/image-rollback.json ]] || die '请先继续未完成的版本回退。'
+  [[ ! -f $ROOT/state/update.json && ! -f $ROOT/state/image-rollback.json ]] || die '请先通过菜单 5 继续未完成的更新或版本回退。'
   [[ ! -f $ROOT/state/progress.json ]] || [[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]] || die '请先继续完成安装。'
   load_state
+  local backup current_version=$VERSION
+  recent_releases stable update "$current_version" <<<'[]' >/dev/null || die '当前版本号无效。'
+  choose_version update "$current_version" || return 0
+  version_allowed update "$current_version" "$VERSION" || { info '目标版本不高于当前版本，无需更新。'; return 0; }
+  pull_app_version
+  version_allowed update "$current_version" "$VERSION" || { info '目标版本不高于当前版本，无需更新。'; return 0; }
+  install_command
   configure_timezone
-  local backup current_version=$VERSION current_image=$APP_IMAGE
-  choose_version || return 0
-  if [[ $VERSION == "$current_version" && $APP_IMAGE == "$current_image" ]]; then
-    info "当前已运行 $VERSION，无需更新。"
-    return 0
-  fi
   mkdir -p "$ROOT/backups"
   backup=$(mktemp -d "$ROOT/backups/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
   cp "$ROOT/config/compose.yaml" "$ROOT/state/state.json" "$backup/"
@@ -1547,15 +1682,17 @@ rollback_stack() {
   ensure_layout
   [[ ! -f $ROOT/state/reinstall.json ]] || die '请先通过菜单 5 继续镜像重装。'
   preflight; load_state
-  [[ ! -f $ROOT/state/update.json ]] || die '请先恢复未完成的更新。'
-  if [[ -f $ROOT/state/image-rollback.json ]]; then finish_image_rollback; return; fi
+  [[ ! -f $ROOT/state/update.json && ! -f $ROOT/state/image-rollback.json ]] || die '请先通过菜单 5 继续未完成的更新或版本回退。'
+  [[ ! -f $ROOT/state/progress.json ]] || [[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]] || die '请先通过菜单 5 继续完成安装。'
   local pages current=$VERSION
-  pages=$(fetch_releases 5) || die '无法读取官方版本，请检查 GitHub 网络后重试。'
-  select_version_menu "$pages"
-  select_available_image "$pages" specified || return 0
-  [[ $VERSION != "$current" ]] || { info '选择的是当前版本，无需切换。'; return; }
+  recent_releases stable rollback "$current" <<<'[]' >/dev/null || die '当前版本号无效。'
+  pages=$(fetch_releases 5 rollback "$current") || die '无法读取官方版本，请检查 GitHub 网络后重试。'
+  select_version_menu "$pages" rollback "$current" || return 0
+  select_available_image "$pages" specified rollback "$current" || return 0
   confirm "主控 $current → $VERSION，保留当前数据。继续？" || return 0
+  version_allowed rollback "$current" "$VERSION" || { info '目标版本不低于当前版本，无需回退。'; return 0; }
   pull_app_version
+  version_allowed rollback "$current" "$VERSION" || { info '目标版本不低于当前版本，无需回退。'; return 0; }
   jq -n --arg version "$VERSION" --arg app "$APP_IMAGE" --arg channel "$CHANNEL" '{version:$version,app:$app,channel:$channel}' > "$ROOT/state/image-rollback.json.tmp"
   mv "$ROOT/state/image-rollback.json.tmp" "$ROOT/state/image-rollback.json"
   finish_image_rollback
@@ -2074,6 +2211,9 @@ usage() {
   --cf-token-file /root/token root 所有、600 权限的 Token 文件
   --yes                      接受全新环境提示；必须五分钟内另开 SSH 执行 confirm-network
 安装需确认新 SSH 连接；check 只检查环境，不修改系统。
+install 仅用于首次安装或继续未完成的安装；已安装服务使用 resume 恢复。
+update 仅升级，rollback 仅降级；正式版与测试版按版本号统一比较。
+指定版本列出所选通道中符合升降方向的最近 5 个版本；相同版本不切换。
 reinstall 重新拉取当前版本镜像，仅重建妙妙屋容器，保留全部数据和配置。
 self-update 从最新正式 Release 更新管理脚本，并校验 SHA-256。
 打开管理菜单时自动检测脚本新版本；检测失败不影响使用，菜单 9 手动更新。
@@ -2621,7 +2761,7 @@ menu_header() {
   printf '\n'
 }
 menu() {
-  local choice action
+  local choice action install_label
   local -a arguments=()
   [[ -z $TOKEN_FILE ]] || arguments+=(--cf-token-file "$TOKEN_FILE")
   [[ -z $DOMAIN ]] || arguments+=(--domain "$DOMAIN")
@@ -2631,10 +2771,13 @@ menu() {
   check_script_update
   while true; do
     menu_header
-    printf '  服务\n    1  安装 / 继续安装\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n    7  强制重新安装\n\n  管理\n    8  Caddy 管理\n    9  更新管理脚本\n   10  卸载服务\n   11  卸载管理脚本\n\n    0  退出\n\n'
+    installation_status
+    install_label='安装 / 继续安装'
+    if [[ $INSTALL_STATUS == installed ]]; then install_label+='（已安装）'; fi
+    printf '  服务\n    1  %s\n    2  更新主控版本\n    3  运行状态\n    4  查看日志\n    5  继续任务 / 恢复服务\n    6  回退主控版本\n    7  强制重新安装\n\n  管理\n    8  Caddy 管理\n    9  更新管理脚本\n   10  卸载服务\n   11  卸载管理脚本\n\n    0  退出\n\n' "$install_label"
     choice=$(ask '选择：')
     case "$choice" in
-      1) action=install;; 2) action=update;; 3) action=status;; 4) action=log-menu;;
+      1) if ! (install_entry_guard); then continue; fi; action=install;; 2) action=update;; 3) action=status;; 4) action=log-menu;;
       5) action=resume;; 6) action=rollback;;
       7) action=reinstall;; 8) action=caddy;; 9) action=self-update;; 10) action=uninstall;; 11) action=uninstall-script;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
@@ -2666,6 +2809,7 @@ main() {
   CADDY_DOMAIN_TARGET=$DOMAIN
   [[ $EUID == 0 ]] || die '请使用 root 运行。'
   if [[ -z $ACTION ]]; then open_installed_menu; return; fi
+  if [[ $ACTION == install ]]; then install_entry_guard; fi
   case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token|caddy-domain) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
   case "$ACTION" in install|update|reinstall|uninstall|resume|rollback|self-update|caddy-reload|caddy-restart|caddy-token|caddy-domain|check)
     trace_start "$ACTION" || die '无法创建任务日志。';;

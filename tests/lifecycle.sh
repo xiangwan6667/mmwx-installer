@@ -16,6 +16,7 @@ install_command() { :; }
 configure_timezone() { :; }
 load_state() { VERSION=v0; APP_IMAGE=app:v0; }
 choose_version() { VERSION=v1; }
+pull_app_version() { :; }
 dc() { printf '%s\n' "$*" >> "$ROOT/operations"; }
 tar() { return 1; }
 if (update_stack) >/dev/null 2>&1; then echo 'Failed backup reported success'; exit 1; fi

@@ -124,11 +124,11 @@ reset_case
 if (
   ACTION=update CHANNEL_EXPLICIT=0
   ask() { return 1; }
-  choose_version
+  choose_version update v1
 ) > "$tmp/output" 2>&1; then echo 'Failed prompt silently chose a version'; exit 1; fi
 [[ ! -s $tmp/pulls ]]
 
-# A fallback to the already running digest must not back up or stop the service.
+# A missing newer image cannot fall back to the running or older version.
 reset_case
 printf '{"v3":[10]}' > "$tmp/status"
 printf 'y\n' > "$tmp/answers"
@@ -139,7 +139,8 @@ load_state() { VERSION=v2; APP_IMAGE=app@sha256:v2; CHANNEL=stable; }
 dc() { echo 'Service was touched unexpectedly' >&2; exit 90; }
 update_stack > "$tmp/output"
 [[ -z $(find "$ROOT/backups" -mindepth 1 -print -quit) && ! -f $ROOT/state/update.json ]]
-grep -q '当前.*版本\|无需更新' "$tmp/output"
+grep -q '无需更新' "$tmp/output"
+[[ $(cat "$tmp/checked") == v3 && ! -s $tmp/pulls ]]
 
 # Cancellation is success at the menu level; a failed digest read must remain an error.
 reset_case

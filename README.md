@@ -4,7 +4,7 @@
   <img src="assets/MeowX.png" alt="妙妙屋 X" height="180" />
 </div>
 
-本项目使用 Docker Compose 部署[妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，并配置 Cloudflare DNS、HTTPS 与源站访问防护。管理脚本版本为 **v0.3.0**。
+本项目使用 Docker Compose 部署[妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，并配置 Cloudflare DNS、HTTPS 与源站访问防护。管理脚本版本为 **v0.3.1**。
 
 ## 功能特性
 
@@ -55,12 +55,12 @@ bash -o pipefail -c 'if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca
 
 | 菜单 | 操作 |
 | --- | --- |
-| 1 | 安装 / 继续安装 |
-| 2 | 更新主控版本 |
+| 1 | 安装 / 继续安装（仅首次安装或安装未完成时可用） |
+| 2 | 更新主控版本（仅升级） |
 | 3 | 运行状态 |
 | 4 | 查看日志 |
 | 5 | 继续任务 / 恢复服务 |
-| 6 | 回退主控版本 |
+| 6 | 回退主控版本（仅降级） |
 | 7 | 强制重新安装主控 |
 | 8 | Caddy 管理 |
 | 9 | 更新管理脚本 |
@@ -68,9 +68,13 @@ bash -o pipefail -c 'if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca
 | 11 | 卸载管理脚本 |
 | 0 | 退出 |
 
-主控可选择最新正式版、最新测试版，或所选通道最近 5 个版本中的指定版本。更新前会检查镜像是否已发布、支持本机架构并完成下载；更新失败会恢复原主控版本、数据库和应用文件。菜单 6 仅切换主控镜像，保留当前数据，因此旧版本仍可能与现有数据库不兼容。菜单 7 重新拉取并重建当前版本的主控，不重建 Caddy 和 PostgreSQL。
+安装完成后，菜单 1 标注“已安装”并停止接受安装操作；容器停止或保留数据卸载后使用菜单 5 恢复。直接运行 `mmwx install` 也遵循相同限制。
 
-最新版镜像尚未就绪时，可经 `y/n` 确认使用同通道上一可用版本；网络、限流或鉴权错误时停止。GitHub API 查询失败时尝试读取发布网页。
+主控可选择最新正式版、最新测试版或指定版本。更新只允许高于当前版本，回退只允许低于当前版本；指定版本先按方向筛选，再列出所选通道最近 5 个候选。正式版和测试版可以跨通道切换，统一按版本号比较，例如 `0.5.5-beta.2 < 0.5.5-beta.10 < 0.5.5 < 0.5.6-beta.1`。
+
+更新前检查镜像并完成下载，失败时恢复原主控版本、数据库和应用文件。菜单 6 仅切换主控镜像，保留当前数据，旧版本仍可能与现有数据库不兼容。同版本不会执行更新或回退；菜单 7 可重新拉取并重建当前版本的主控，Caddy 和 PostgreSQL 保持运行。
+
+最新版镜像尚未就绪时，可经 `y/n` 确认使用同通道、符合升降方向的上一可用版本；没有合适候选时返回菜单。镜像仓库的网络、限流或鉴权错误会停止操作。GitHub API 查询失败时尝试读取发布网页；分页达到上限时提示查询范围有限。
 
 菜单 5 用于继续中断的安装或更新、恢复服务，以及完成旧目录迁移。菜单 9 更新管理脚本；旧版没有此入口时，重新执行上方一键安装命令。查看当前脚本版本和参数：
 
@@ -166,7 +170,7 @@ Caddy 的 Cloudflare DNS 模块使用本仓库 [v0.3.0 发布包](https://github
 
 ## 更新日志
 
-查看 [v0.3.0 完整更新日志](CHANGELOG.md) 或 [Releases](https://github.com/xiangwan6667/mmwx-installer/releases)。
+查看 [更新日志](CHANGELOG.md) 或 [Releases](https://github.com/xiangwan6667/mmwx-installer/releases)。
 
 ## 反馈
 

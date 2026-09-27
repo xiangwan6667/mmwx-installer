@@ -14,6 +14,7 @@ preflight() { :; }
 install_command() { :; }
 configure_timezone() { :; }
 choose_version() { VERSION=v2; APP_IMAGE=app:v2; }
+pull_app_version() { :; }
 sync_cf() { echo 'unexpected-sync' >> "$ROOT/calls"; return 1; }
 dc() {
   printf '%s\n' "$*" >> "$ROOT/calls"

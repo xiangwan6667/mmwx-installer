@@ -129,6 +129,7 @@ preflight() { :; }
 install_command() { :; }
 configure_timezone() { :; }
 choose_version() { VERSION=$next_version; APP_IMAGE=$next_image; }
+pull_app_version() { :; }
 sync_cf() { die 'Controller update must not synchronize or reload the gateway.'; }
 
 for service in caddy postgres; do

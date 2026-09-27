@@ -46,7 +46,9 @@ cp ./install.sh "$tmp/mmwx-install.sh"
 (
   # Only bypass root identity/host lock in this private fixture.
   # shellcheck disable=SC2016
-  eval "$(declare -f main | sed 's|\$EUID|0|g; s|/run/mmwx-installer.lock|$ROOT/install.lock|g')"
+  eval "$(declare -f main | sed 's|\$EUID|0|g; s|/run/mmwx-installer.lock|$tmp/install.lock|g')"
+  # Downloads above are test artifacts, separate from the fresh installation root.
+  ROOT=$tmp/fresh-root
   SELF=$tmp/install.sh ACTION='' ACCEPT=0
   flock() { :; }
   confirm() { printf 'consent-boundary\n'; return 1; }
