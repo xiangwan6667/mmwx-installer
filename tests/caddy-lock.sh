@@ -42,6 +42,13 @@ done
   change_caddy_domain() { [[ $CADDY_DOMAIN_TARGET == new.example.com && $DOMAIN == mmwx.example.com ]]; }
   main caddy-domain --domain new.example.com
 )
+for action in caddy-subscription-add caddy-subscription-domain; do
+  (
+    add_caddy_subscription() { [[ ${1:-} == sub.example.com && $DOMAIN == mmwx.example.com ]]; }
+    change_caddy_subscription() { [[ ${1:-} == sub.example.com && $DOMAIN == mmwx.example.com ]]; }
+    main "$action" --domain sub.example.com
+  ) || { echo 'Subscription dispatch did not pass the requested hostname'; exit 1; }
+done
 # A staged token operation blocks conflicting work, including the old timer.
 mkdir "$ROOT/state/caddy-token-change"
 for operation in install_stack update_stack reinstall_stack rollback_stack uninstall_stack; do

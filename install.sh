@@ -2262,7 +2262,9 @@ caddy_require_install() {
   load_state
   valid_domain "$DOMAIN" || die '安装域名无效。'
   if [[ -n $SUBSCRIPTION_DOMAIN ]]; then
-    valid_domain "$SUBSCRIPTION_DOMAIN" && [[ $SUBSCRIPTION_DOMAIN != "$DOMAIN" ]] || die '订阅域名无效或与主控域名重复。'
+    if ! valid_domain "$SUBSCRIPTION_DOMAIN" || [[ $SUBSCRIPTION_DOMAIN == "$DOMAIN" ]]; then
+      die '订阅域名无效或与主控域名重复。'
+    fi
   fi
 }
 caddy_require_idle() {
@@ -2974,8 +2976,8 @@ main() {
     caddy) caddy_menu;;
     caddy-token) replace_caddy_token;;
     caddy-domain) change_caddy_domain;;
-    caddy-subscription-add) add_caddy_subscription;;
-    caddy-subscription-domain) change_caddy_subscription;;
+    caddy-subscription-add) add_caddy_subscription "$CADDY_DOMAIN_TARGET";;
+    caddy-subscription-domain) change_caddy_subscription "$CADDY_DOMAIN_TARGET";;
     caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates) caddy_action "${ACTION#caddy-}";;
   esac
 }
