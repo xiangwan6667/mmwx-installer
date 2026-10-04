@@ -47,7 +47,7 @@ bash -o pipefail -c 'if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca
 
 安装入口会自动注册 `mmwx` 命令。选择 **1 · 安装 / 继续安装**，按提示输入 Token、选择主域名与主控版本，并输入子域名前缀。前缀留空时使用 `mmwx`，例如 `mmwx.example.com`。脚本会创建 DNS 记录；已有且完全匹配的代理 A 记录会复用，其他同名记录冲突时停止。
 
-网络设置完成后，**另开终端通过 IPv4 重新登录 SSH**，再按提示确认连接正常。五分钟内未确认，脚本会恢复原网络设置。安装完成后访问显示的 HTTPS 地址。数据库连接已由环境变量配置，初始化页面无需勾选「使用 PG 数据库」。
+网络设置完成后，**另开终端通过 IPv4 重新登录 SSH**，再按提示确认连接正常。五分钟内未确认，脚本会恢复原网络设置。安装完成后访问显示的 HTTPS 地址。
 
 ## 日常管理
 
@@ -108,7 +108,7 @@ mmwx logs          # 最近 80 行服务日志
 
 ### Caddy 域名与 Token
 
-运行 `mmwx caddy` 或选择菜单 8，可查看状态与日志、校验并重载配置、重启 Caddy、检查 HTTPS，以及更换 Token 或域名。证书检查分别显示本机源站与 Cloudflare 边缘证书的签发者、到期时间和剩余天数。
+运行 `mmwx caddy` 或选择菜单 8，可查看状态与日志、校验并重载配置、重启 Caddy、检查 HTTPS、更换 Token、变更主控域名，以及新增或切换独立订阅域名。证书检查分别显示本机源站与 Cloudflare 边缘证书的签发者、到期时间和剩余天数。
 
 更换 Token 可在菜单中隐藏输入，也可从权限为 `600`、由 root 所有的文件读取：
 
@@ -116,7 +116,7 @@ mmwx logs          # 最近 80 行服务日志
 mmwx caddy-token --cf-token-file /root/cloudflare.token
 ```
 
-新 Token 必须具备当前区域的读取和 DNS 编辑权限。脚本会先用临时 TXT 记录验证权限，成功后才替换凭据并重建 Caddy；失败时恢复旧配置。主控和 PostgreSQL 保持运行。
+新 Token 必须具备主控与订阅域名所在区域的读取和 DNS 编辑权限。脚本会先用临时 TXT 记录逐个验证区域权限，成功后才替换凭据并重建 Caddy；失败时恢复旧配置。主控和 PostgreSQL 保持运行。
 
 变更域名可在 Caddy 菜单中操作，或运行：
 
@@ -124,7 +124,22 @@ mmwx caddy-token --cf-token-file /root/cloudflare.token
 mmwx caddy-domain
 ```
 
-新域名必须位于 Active 区域，当前 Token 须同时有新旧区域的读取与 DNS 编辑权限。脚本为新域名创建或复用代理 A 记录、申请证书并检查 HTTPS，仅重载 Caddy，保留所有容器与数据。成功后自动删除由脚本创建、仍指向本机且未被修改的旧代理 A 记录；其他记录保留。失败或中断后，用主菜单 5 恢复任务；旧解析清理失败时保留新域名服务，恢复任务会重试清理。
+新域名必须位于 Active 区域，当前 Token 须同时有新旧区域的读取与 DNS 编辑权限。脚本为新域名创建或复用代理 A 记录、申请证书并检查 HTTPS，仅重载 Caddy，保留所有容器与数据。
+
+新证书与反代就绪后，新旧主控域名同时保留。按提示进入面板 **系统设置 → 系统** 完成迁移域名设置，并确认 Agent 连接正常，再回到终端确认清理旧域名。暂未完成时选择 `n`，稍后用主菜单 5 继续。只有确认迁移完成后，脚本才撤下旧反代并删除由脚本创建、仍指向本机且未被修改的旧代理 A 记录；其他记录保留。验证失败会恢复旧配置；清理失败保留新域名服务，菜单 5 可重试。
+
+Caddy 子菜单 **8 · 新增订阅域名**、**9 · 切换订阅域名**，也可直接执行：
+
+```bash
+mmwx caddy-subscription-add
+mmwx caddy-subscription-domain
+# 指定区域与前缀（留空时默认 mmw）：
+mmwx caddy-subscription-add --zone example.com --prefix mmw
+```
+
+订阅域名与主控域名分别保存，不能使用同一个域名。脚本自动配置 DNS、证书和反代，新增后按提示到面板 **系统设置 → 系统 → 订阅域名** 填写完整地址（如 `https://mmw.example.com`）并保存。切换时先保留新旧订阅域名，确认面板设置已更新、订阅正常后才清理旧域名；暂未完成可从主菜单 5 继续。
+
+按照[官方订阅域名文档](https://miaomiaowux.com/docs/domain-subscription/)，订阅域名仅放行 `/x/*`、`/api/fw/*`、`/api/clash/subscribe`、`/api/user/package-subscribe` 和 `/api/subscribe`，其余路径返回 404。
 
 ## 数据与恢复
 

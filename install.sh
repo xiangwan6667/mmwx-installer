@@ -6,7 +6,7 @@ ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
 SCRIPT_VERSION=0.3.1
 SCRIPT_UPDATE_CHECKED=0 SCRIPT_UPDATE_VERSION=''
-CHANNEL='' DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
+CHANNEL='' DOMAIN='' SUBSCRIPTION_DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 TRACE_LOG='' TRACE_ACTION=''
@@ -417,7 +417,7 @@ networks:
 EOF
 }
 render_caddy() {
-  local proxies='' domain=${1:-$DOMAIN} ranges=$ROOT/state/cloudflare-v4.txt
+  local proxies='' domain=${1:-$DOMAIN} subscription=${2-$SUBSCRIPTION_DOMAIN} ranges=$ROOT/state/cloudflare-v4.txt
   [[ -f $ranges ]] || ranges=$ROOT/cloudflare-v4.txt
   if [[ -f $ranges ]]; then
     validate_cidrs < "$ranges"
@@ -437,6 +437,24 @@ $domain {
     resolvers 1.1.1.1 1.0.0.1
   }
   reverse_proxy mmwx:12889
+}
+EOF
+  [[ -n $subscription ]] || return 0
+  cat <<EOF
+$subscription {
+  tls {
+    dns cloudflare {env.CF_API_TOKEN}
+    resolvers 1.1.1.1 1.0.0.1
+  }
+  @subscriptions {
+    path /x/* /api/fw/* /api/clash/subscribe /api/user/package-subscribe /api/subscribe
+  }
+  handle @subscriptions {
+    reverse_proxy mmwx:12889
+  }
+  handle {
+    respond 404
+  }
 }
 EOF
 }
@@ -836,7 +854,7 @@ sync_cf() (
   apply_firewall_rules
   remove_legacy_cf_rules
   if [[ -f $state/state.json ]]; then
-    render_caddy "$(jq -er .domain "$state/state.json")" > "$config/Caddyfile.next"
+    render_caddy "$(jq -er .domain "$state/state.json")" "$(jq -r '.subscription_domain // ""' "$state/state.json")" > "$config/Caddyfile.next"
     # Keep the inode: Caddy mounts this individual file.
     cat "$config/Caddyfile.next" > "$config/Caddyfile"
     rm -f "$config/Caddyfile.next"
@@ -1168,7 +1186,7 @@ EOF
   run_step '启用 CF 网段定时刷新' systemctl enable --now mmwx-cf-sync.timer
 }
 save_state() {
-  jq -n --arg domain "$DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{domain:$domain,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/state/state.json.tmp"
+  jq -n --arg domain "$DOMAIN" --arg subscription "$SUBSCRIPTION_DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{domain:$domain,subscription_domain:$subscription,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/state/state.json.tmp"
   mv "$ROOT/state/state.json.tmp" "$ROOT/state/state.json"
 }
 verify_https() {
@@ -1263,6 +1281,7 @@ caddy_tls_diagnose() (
 load_state() {
   [[ -f $ROOT/state/state.json ]] || die '未发现本安装器的安装记录。'
   DOMAIN=$(jq -er .domain "$ROOT/state/state.json")
+  SUBSCRIPTION_DOMAIN=$(jq -r '.subscription_domain // ""' "$ROOT/state/state.json")
   CHANNEL=${CHANNEL:-$(jq -er .channel "$ROOT/state/state.json")}
   VERSION=$(jq -er .version "$ROOT/state/state.json")
   APP_IMAGE=$(jq -er .app "$ROOT/state/state.json")
@@ -1271,13 +1290,14 @@ load_state() {
 }
 checkpoint() {
   STAGE=$1
-  jq -n --argjson stage "$STAGE" --arg domain "$DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{stage:$stage,domain:$domain,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/state/progress.json.tmp"
+  jq -n --argjson stage "$STAGE" --arg domain "$DOMAIN" --arg subscription "$SUBSCRIPTION_DOMAIN" --arg channel "$CHANNEL" --arg version "$VERSION" --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" '{stage:$stage,domain:$domain,subscription_domain:$subscription,channel:$channel,version:$version,app:$app,caddy:$caddy,pg:$pg}' > "$ROOT/state/progress.json.tmp"
   mv "$ROOT/state/progress.json.tmp" "$ROOT/state/progress.json"
 }
 load_progress() {
   jq -e '.stage|type=="number" and .>=0 and .<=7' "$ROOT/state/progress.json" >/dev/null || die '安装进度异常。'
   STAGE=$(jq -r .stage "$ROOT/state/progress.json")
   DOMAIN=$(jq -r '.domain // ""' "$ROOT/state/progress.json")
+  SUBSCRIPTION_DOMAIN=$(jq -r '.subscription_domain // ""' "$ROOT/state/progress.json")
   CHANNEL=$(jq -r '.channel // ""' "$ROOT/state/progress.json")
   VERSION=$(jq -r '.version // ""' "$ROOT/state/progress.json")
   APP_IMAGE=$(jq -r '.app // ""' "$ROOT/state/progress.json")
@@ -1447,7 +1467,7 @@ install_stack() {
   run_step '启动服务' dc up -d --wait --wait-timeout 300
   verify_https
   checkpoint 7
-  printf '\n安装完成：https://%s\n管理菜单：mmwx\n数据库由环境变量管理，无需勾选「使用 PG 数据库」。\n' "$DOMAIN"
+  printf '\n安装完成：https://%s\n管理菜单：mmwx\n' "$DOMAIN"
 }
 write_update_progress() {
   jq -n --arg phase "$1" --arg backup "$2" --arg scope "${3:-mmwx}" '{phase:$phase,backup:$backup,service_scope:$scope}' > "$ROOT/state/update.json.tmp"
@@ -2156,7 +2176,8 @@ caddy_action() {
   case "$action" in
     status)
       section 'Caddy 运行状态'
-      printf '  域名：%s\n' "$DOMAIN"
+      printf '  主控域名：%s\n' "$DOMAIN"
+      [[ -z $SUBSCRIPTION_DOMAIN ]] || printf '  订阅域名：%s\n' "$SUBSCRIPTION_DOMAIN"
       caddy_redacted_command dc ps caddy || return $?
       caddy_redacted_command dc exec -T caddy caddy version;;
     logs) caddy_redacted_command dc logs --tail 80 caddy;;
@@ -2188,11 +2209,12 @@ caddy_menu() {
   [[ -z $TOKEN_FILE ]] || arguments+=(--cf-token-file "$TOKEN_FILE")
   while true; do
     section 'Caddy 管理'
-    printf '    1  查看运行状态\n    2  查看最近 80 行日志\n    3  校验并重载配置\n    4  重启 Caddy\n    5  查看源站 / Cloudflare 边缘证书\n    6  更换 Cloudflare Token\n    7  变更域名\n\n    0  返回\n\n'
+    printf '    1  查看运行状态\n    2  查看最近 80 行日志\n    3  校验并重载配置\n    4  重启 Caddy\n    5  查看源站 / Cloudflare 边缘证书\n    6  更换 Cloudflare Token\n    7  变更主控域名\n    8  新增订阅域名\n    9  切换订阅域名\n\n    0  返回\n\n'
     choice=$(ask '选择：')
     case "$choice" in
       1) action=caddy-status;; 2) action=caddy-logs;; 3) action=caddy-reload;;
       4) action=caddy-restart;; 5) action=caddy-certificates;; 6) action=caddy-token;; 7) action=caddy-domain;;
+      8) action=caddy-subscription-add;; 9) action=caddy-subscription-domain;;
       0) return 0;; *) printf '无效选择。\n'; continue;;
     esac
     if /bin/bash "$SELF" "$action" "${arguments[@]}"; then :; else info '操作未完成，可从菜单重试。'; fi
@@ -2220,7 +2242,11 @@ self-update 从最新正式 Release 更新管理脚本，并校验 SHA-256。
 trace 查看最近任务及失败原因；trace-follow 实时追踪；log-menu 打开日志与诊断。
 caddy 打开网关管理菜单；caddy-token --cf-token-file /root/token 替换 Token。
 caddy-domain 选择新主域名及前缀；也可用 --zone example.com --prefix mmwx。
-新域名验证通过后自动删除脚本创建且仍指向本机的旧 A 记录；中断用菜单 5 恢复。
+新证书与反代就绪后，到面板「系统设置 → 系统」迁移域名，确认完成后清理旧域名。
+caddy-subscription-add 新增独立订阅域名，前缀默认 mmw。
+caddy-subscription-domain 切换订阅域名；也可用 --zone example.com --prefix mmw。
+订阅域名仅开放订阅路径；到「系统设置 → 系统」更新订阅域名后确认清理旧域名。
+暂未完成面板设置或任务中断时，用菜单 5 继续。
 caddy-status / caddy-logs / caddy-reload / caddy-restart / caddy-certificates 可直接执行。
 EOF
 }
@@ -2235,6 +2261,9 @@ caddy_require_install() {
   done
   load_state
   valid_domain "$DOMAIN" || die '安装域名无效。'
+  if [[ -n $SUBSCRIPTION_DOMAIN ]]; then
+    valid_domain "$SUBSCRIPTION_DOMAIN" && [[ $SUBSCRIPTION_DOMAIN != "$DOMAIN" ]] || die '订阅域名无效或与主控域名重复。'
+  fi
 }
 caddy_require_idle() {
   local task
@@ -2362,7 +2391,9 @@ caddy_token_cleanup() {
   jq '.txt_clean=true' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json"
 }
 caddy_token_probe() {
-  local dir=$ROOT/state/caddy-token-change page=1 pages zone random
+  local dir=$ROOT/state/caddy-token-change page=1 pages zone random domain value
+  local -a probe_domains=() probe_zones=()
+  local -A seen=()
   printf '[]' > "$dir/zones.json" || return 1
   while true; do
     caddy_token_request GET "/zones?status=active&per_page=50&page=$page" '' "$dir/response.json" || return 1
@@ -2374,19 +2405,30 @@ caddy_token_probe() {
     ((page < pages)) || break
     page=$((page+1))
   done
-  zone=$(jq -r --arg domain "$DOMAIN" '[.[] | select(.status=="active") | . as $z | select($domain==$z.name or ($domain|endswith("."+$z.name)))] | sort_by(.name|length) | last | .id // ""' "$dir/zones.json")
-  [[ $zone =~ ^[a-zA-Z0-9]+$ ]] || return 1
-  local value
-  random=$(openssl rand -hex 16) || return 1
-  value=$(openssl rand -hex 24) || return 1
-  jq --arg zone "$zone" --arg name "_mmwx-token-$random.$DOMAIN" --arg value "$value" --arg comment "mmwx-token-check-$random" \
-    '.zone=$zone | .name=$name | .value=$value | .comment=$comment' "$dir/journal.json" > "$dir/journal.tmp" || return 1
-  mv "$dir/journal.tmp" "$dir/journal.json" || return 1
-  jq '{type:"TXT",name:.name,content:.value,ttl:60,comment:.comment}' "$dir/journal.json" > "$dir/create.json" || return 1
-  caddy_token_request POST "/zones/$zone/dns_records" "$dir/create.json" "$dir/response.json" || return 1
-  jq -e '.result.id|type=="string" and test("^[a-zA-Z0-9]+$")' "$dir/response.json" >/dev/null || return 1
-  jq --slurpfile response "$dir/response.json" '.record_id=$response[0].result.id' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json" || return 1
-  caddy_token_cleanup 1 || return 1
+  # Check all configured domains before creating any probe. One DNS Edit probe
+  # per distinct zone also covers subscription certificate renewals.
+  for domain in "$DOMAIN" "$SUBSCRIPTION_DOMAIN"; do
+    [[ -n $domain ]] || continue
+    zone=$(jq -r --arg domain "$domain" '[.[] | select(.status=="active") | . as $z | select($domain==$z.name or ($domain|endswith("."+$z.name)))] | sort_by(.name|length) | last | .id // ""' "$dir/zones.json") || return 1
+    [[ $zone =~ ^[a-zA-Z0-9]+$ ]] || { info "新 Token 未授权域名区域：$domain"; return 1; }
+    [[ -z ${seen[$zone]:-} ]] || continue
+    seen[$zone]=1
+    probe_domains+=("$domain"); probe_zones+=("$zone")
+  done
+  local index
+  for index in "${!probe_zones[@]}"; do
+    zone=${probe_zones[$index]} domain=${probe_domains[$index]}
+    random=$(openssl rand -hex 16) || return 1
+    value=$(openssl rand -hex 24) || return 1
+    jq --arg zone "$zone" --arg name "_mmwx-token-$random.$domain" --arg value "$value" --arg comment "mmwx-token-check-$random" \
+      'del(.record_id,.delete_started,.txt_clean) | .zone=$zone | .name=$name | .value=$value | .comment=$comment' "$dir/journal.json" > "$dir/journal.tmp" || return 1
+    mv "$dir/journal.tmp" "$dir/journal.json" || return 1
+    jq '{type:"TXT",name:.name,content:.value,ttl:60,comment:.comment}' "$dir/journal.json" > "$dir/create.json" || return 1
+    caddy_token_request POST "/zones/$zone/dns_records" "$dir/create.json" "$dir/response.json" || return 1
+    jq -e '.result.id|type=="string" and test("^[a-zA-Z0-9]+$")' "$dir/response.json" >/dev/null || return 1
+    jq --slurpfile response "$dir/response.json" '.record_id=$response[0].result.id' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json" || return 1
+    caddy_token_cleanup 1 || return 1
+  done
   caddy_token_phase validated
 }
 caddy_token_replace_files() {
@@ -2482,10 +2524,12 @@ assert len(a)==1 and ipaddress.ip_address(a[0]).version==4
 print(a[0])'
 }
 caddy_domain_plan() {
-  local target=${1:-} dir=$ROOT/state/caddy-domain-change page=1 pages zone chosen count pick old oldzone newzone ipv4
-  old=$(jq -er .old_domain "$dir/journal.json") || return 1
+  local target=${1:-} dir=$ROOT/state/caddy-domain-change page=1 pages zone chosen count pick old oldzone='' newzone ipv4 kind default_prefix=mmwx
+  old=$(jq -r .old_domain "$dir/journal.json") || return 1
+  kind=$(jq -r '.kind // "master"' "$dir/journal.json") || return 1
+  [[ $kind != subscription ]] || default_prefix=mmw
   # shellcheck disable=SC2016
-  if [[ $target == "$old" ]]; then caddy_domain_journal --arg new "$target" '.new_domain=$new'; return; fi
+  if [[ -n $target && $target == "$old" ]]; then caddy_domain_journal --arg new "$target" '.new_domain=$new'; return; fi
   printf '[]' > "$dir/zones.json"
   while true; do
     caddy_domain_request GET "/zones?status=active&per_page=50&page=$page" '' "$dir/response.json" || return 1
@@ -2507,13 +2551,17 @@ caddy_domain_plan() {
       [[ $pick =~ ^[1-9][0-9]*$ && ${#pick} -le 4 && $pick -le $count ]] || return 1
     fi
     chosen=$(jq -r --argjson index "$((pick-1))" '.[$index].name' "$dir/choices.json") || return 1
-    [[ -n $PREFIX ]] || PREFIX=$(ask '子域名前缀 [mmwx]：') || return 1
-    target=$(join_domain "${PREFIX:-mmwx}" "$chosen") || return 1
+    [[ -n $PREFIX ]] || PREFIX=$(ask "子域名前缀 [$default_prefix]：") || return 1
+    target=$(join_domain "${PREFIX:-$default_prefix}" "$chosen") || return 1
   fi
   valid_domain "$target" || return 1
+  if [[ $kind == subscription && $target == "$DOMAIN" ]] || [[ $kind == master && $target == "$SUBSCRIPTION_DOMAIN" ]]; then
+    info '主控域名和订阅域名不能相同。'; return 1
+  fi
   # shellcheck disable=SC2016
   if [[ $target == "$old" ]]; then caddy_domain_journal --arg new "$target" '.new_domain=$new'; return; fi
   for zone in "$old" "$target"; do
+    [[ -n $zone ]] || continue
     chosen=$(jq -r --arg domain "$zone" '[.[] | . as $z | select($domain==$z.name or ($domain|endswith("."+$z.name)))] | sort_by(.name|length) | last | .id // ""' "$dir/zones.json") || return 1
     [[ $chosen =~ ^[A-Za-z0-9]+$ ]] || { info "当前 Token 未授权 Active 区域：$zone"; return 1; }
     if [[ $zone == "$old" ]]; then oldzone=$chosen; else newzone=$chosen; fi
@@ -2521,10 +2569,13 @@ caddy_domain_plan() {
   ipv4=$(caddy_domain_local_ipv4) || return 1
   caddy_domain_records "$newzone" "$target" "$dir/new-records.json" || return 1
   dns_record_action "$ipv4" < "$dir/new-records.json" >/dev/null || { info '新域名已有冲突的 DNS 记录，未覆盖。'; return 1; }
-  caddy_domain_records "$oldzone" "$old" "$dir/old-records-response.json" || return 1
-  jq --arg ip "$ipv4" '[.result[] | select(.type=="A" and .content==$ip and .proxied==true and
-    ((.comment // "")=="mmwx-installer" or ((.comment // "")|test("^mmwx-installer-domain-[0-9a-f]{32}$"))))]' \
-    "$dir/old-records-response.json" > "$dir/old_records.json" || return 1
+  printf '[]' > "$dir/old_records.json" || return 1
+  if [[ -n $old ]]; then
+    caddy_domain_records "$oldzone" "$old" "$dir/old-records-response.json" || return 1
+    jq --arg ip "$ipv4" '[.result[] | select(.type=="A" and .content==$ip and .proxied==true and
+      ((.comment // "")=="mmwx-installer" or ((.comment // "")|test("^mmwx-installer-domain-[0-9a-f]{32}$"))))]' \
+      "$dir/old-records-response.json" > "$dir/old_records.json" || return 1
+  fi
   # jq variables are passed with --arg, not expanded by the shell.
   # shellcheck disable=SC2016
   caddy_domain_journal --arg domain "$target" --arg oldzone "$oldzone" --arg newzone "$newzone" --arg ip "$ipv4" \
@@ -2552,7 +2603,10 @@ caddy_domain_ensure_dns() {
 caddy_domain_cleanup_dns() {
   local which=$1 dir=$ROOT/state/caddy-domain-change zone name ipv4 comment id
   case "$which" in
-    old) zone=$(jq -er .old_zone "$dir/journal.json") && name=$(jq -er .old_domain "$dir/journal.json") || return 1;;
+    old)
+      name=$(jq -r .old_domain "$dir/journal.json") || return 1
+      [[ -n $name ]] || return 0
+      zone=$(jq -er .old_zone "$dir/journal.json") || return 1;;
     new)
       [[ $(jq -r .create_started "$dir/journal.json") == true ]] || return 0
       zone=$(jq -er .new_zone "$dir/journal.json") && name=$(jq -er .new_domain "$dir/journal.json") || return 1;;
@@ -2588,7 +2642,8 @@ caddy_domain_phase() {
   jq --arg phase "$1" '.phase=$phase' "$dir/journal.json" > "$dir/journal.tmp" && mv "$dir/journal.tmp" "$dir/journal.json"
 }
 caddy_domain_stage() (
-  local staging file random
+  local kind=${1:-master} staging file random old=$DOMAIN
+  case "$kind" in master) ;; subscription) old=$SUBSCRIPTION_DOMAIN;; *) return 1;; esac
   caddy_token_pending_guard
   staging=$(mktemp -d "$ROOT/state/.caddy-domain-XXXXXX") || return 1
   trap 'rm -rf -- "$staging"' EXIT
@@ -2601,8 +2656,8 @@ caddy_domain_stage() (
     fi
   done
   random=$(openssl rand -hex 16) || return 1
-  jq -n --arg old "$DOMAIN" --arg comment "mmwx-installer-domain-$random" \
-    '{phase:"preparing",old_domain:$old,new_domain:"",create_started:false,new_comment:$comment}' > "$staging/journal.json" || return 1
+  jq -n --arg kind "$kind" --arg master "$DOMAIN" --arg old "$old" --arg comment "mmwx-installer-domain-$random" \
+    '{phase:"preparing",kind:$kind,master_domain:$master,old_domain:$old,new_domain:"",create_started:false,new_comment:$comment}' > "$staging/journal.json" || return 1
   chmod 600 "$staging"/* || return 1
   mv "$staging" "$ROOT/state/caddy-domain-change"
 )
@@ -2613,9 +2668,16 @@ caddy_domain_reload() {
 caddy_domain_verify() {
   caddy_ready 300 || return 1
   # Public DNS may take a little longer to reach the new Cloudflare record.
-  local attempt
+  local attempt code kind
+  kind=$(jq -r '.kind // "master"' "$ROOT/state/caddy-domain-change/journal.json") || return 1
   for ((attempt=0; attempt<6; attempt++)); do
-    if curl -q --proto '=https' --proto-redir '=https' --noproxy '*' \
+    if [[ $kind == subscription ]]; then
+      # A subscription-only host deliberately returns 404 at /. Never bypass TLS.
+      if code=$(curl -q --proto '=https' --noproxy '*' -sS --connect-timeout 3 --max-time 10 \
+        "https://$DOMAIN/" -o /dev/null -w '%{http_code}') && [[ $code == 404 ]] &&
+        code=$(curl -q --proto '=https' --noproxy '*' -sS --connect-timeout 3 --max-time 10 \
+          "https://$DOMAIN/api/subscribe" -o /dev/null -w '%{http_code}') && [[ $code =~ ^[234][0-9][0-9]$ ]]; then return 0; fi
+    elif curl -q --proto '=https' --proto-redir '=https' --noproxy '*' \
       -fsS --connect-timeout 3 --max-time 10 "https://$DOMAIN/" -o /dev/null; then return 0; fi
     sleep 2
   done
@@ -2623,34 +2685,89 @@ caddy_domain_verify() {
   return 1
 }
 caddy_domain_write_state() {
-  local file dir=$ROOT/state/caddy-domain-change
+  local file dir=$ROOT/state/caddy-domain-change key=domain new
+  [[ $(jq -r '.kind // "master"' "$dir/journal.json") != subscription ]] || key=subscription_domain
+  new=$(jq -er .new_domain "$dir/journal.json") || return 1
   for file in state progress; do
     [[ -f $dir/old.$file.json ]] || continue
-    jq --arg domain "$DOMAIN" '.domain=$domain' "$dir/old.$file.json" > "$ROOT/state/$file.json.tmp" &&
+    jq --arg key "$key" --arg domain "$new" '.[$key]=$domain' "$dir/old.$file.json" > "$ROOT/state/$file.json.tmp" &&
       mv "$ROOT/state/$file.json.tmp" "$ROOT/state/$file.json" || return 1
   done
 }
-recover_caddy_domain() (
+caddy_domain_verify_new() { local DOMAIN=$1; caddy_domain_verify; }
+caddy_domain_ready_new() { local DOMAIN=$1; caddy_ready; }
+caddy_domain_finish() {
+  local dir=$ROOT/state/caddy-domain-change kind old new master subscription
+  kind=$(jq -r '.kind // "master"' "$dir/journal.json") || return 1
+  old=$(jq -r .old_domain "$dir/journal.json") || return 1
+  new=$(jq -er .new_domain "$dir/journal.json") || return 1
+  if [[ $(jq -r .phase "$dir/journal.json") == awaiting-migration ]]; then
+    info "新域名证书与反代已就绪：https://$new"
+    if [[ $kind == subscription ]]; then
+      info "请到面板「系统设置 → 系统」将「订阅域名」更新为 https://$new 并保存。"
+      if ! confirm '已更新面板订阅域名并确认订阅正常，清理旧订阅域名？'; then
+        info '新旧订阅域名继续服务；完成面板设置后用菜单 5 继续。'; return 0
+      fi
+    else
+      info "请到面板「系统设置 → 系统」执行迁移域名设置，将主服务器地址迁移为 https://$new，并确认 Agent 连接正常。"
+      if ! confirm '已完成面板域名迁移，清理旧主控域名？'; then
+        info '新旧主控域名继续服务；完成面板迁移后用菜单 5 继续。'; return 0
+      fi
+    fi
+    caddy_domain_phase finalizing || return 1
+  fi
+  master=$DOMAIN subscription=$SUBSCRIPTION_DOMAIN
+  if [[ $kind == subscription ]]; then subscription=$new; else master=$new; fi
+  render_caddy "$master" "$subscription" > "$dir/candidate.Caddyfile" || return 1
+  cat "$dir/candidate.Caddyfile" > "$ROOT/config/Caddyfile" || return 1
+  caddy_domain_reload || return 1
+  caddy_domain_ready_new "$new" || return 1
+  caddy_domain_write_state && caddy_domain_phase committed || return 1
+  caddy_domain_cleanup_dns old || { info '新域名保持服务，旧 DNS 清理未完成；请用菜单 5 继续。'; return 1; }
+  caddy_domain_discard || return 1
+  info "域名配置已完成：https://$new"
+  if [[ $kind == subscription && -z $old ]]; then
+    info "请到面板「系统设置 → 系统」填写「订阅域名」https://$new 并保存。"
+  fi
+}
+recover_caddy_domain() {
   set +x
-  local dir=$ROOT/state/caddy-domain-change phase file old new
+  local dir=$ROOT/state/caddy-domain-change phase file old new current kind DOMAIN=$DOMAIN SUBSCRIPTION_DOMAIN=$SUBSCRIPTION_DOMAIN
   caddy_require_install write
   caddy_require_idle
   [[ ! -e $ROOT/state/caddy-token-change ]] || die '存在冲突的 Token 任务，请先检查恢复记录。'
   [[ -d $dir && ! -L $dir && -f $dir/journal.json && ! -L $dir/journal.json ]] || die '域名恢复记录缺失或异常。'
   phase=$(jq -er .phase "$dir/journal.json") || die '域名恢复阶段无效。'
-  old=$(jq -er .old_domain "$dir/journal.json") || return 1
+  old=$(jq -r .old_domain "$dir/journal.json") || return 1
   new=$(jq -r .new_domain "$dir/journal.json") || return 1
-  if ! valid_domain "$old" || [[ $DOMAIN != "$old" && $DOMAIN != "$new" ]]; then die '域名恢复记录不匹配。'; fi
+  kind=$(jq -r '.kind // "master"' "$dir/journal.json") || return 1
+  current=$DOMAIN
+  case "$kind" in
+    master) valid_domain "$old" || die '旧主控域名无效。';;
+    subscription)
+      current=$SUBSCRIPTION_DOMAIN
+      [[ $(jq -r .master_domain "$dir/journal.json") == "$DOMAIN" ]] || die '主控域名与订阅恢复记录不匹配。'
+      [[ -z $old ]] || valid_domain "$old" || die '旧订阅域名无效。';;
+    *) die '未知域名类型，恢复记录保留。';;
+  esac
+  [[ $current == "$old" || $current == "$new" ]] || die '域名恢复记录不匹配。'
+  if [[ $phase != preparing ]]; then
+    valid_domain "$new" || die '新域名恢复记录无效。'
+    [[ $kind != subscription || $new != "$DOMAIN" ]] || die '订阅域名与主控域名冲突。'
+  fi
   case "$phase" in
+    awaiting-migration|finalizing)
+      caddy_domain_finish || die '域名迁移清理未完成，新域名与记录保留；请重试菜单 5。'
+      return;;
     committed)
-      [[ $DOMAIN == "$new" ]] || die '已提交域名与安装记录不匹配。'
+      [[ $current == "$new" ]] || die '已提交域名与安装记录不匹配。'
       caddy_domain_cleanup_dns old || die '旧 DNS 清理未完成，新域名保持服务；请重试菜单 5。';;
     preparing) ;;
     dns|restored) caddy_domain_cleanup_dns new || die '新 DNS 清理未完成，请重试菜单 5。';;
     applying|rollback)
       caddy_domain_phase rollback || return 1
       [[ -f $dir/old.Caddyfile && ! -L $dir/old.Caddyfile ]] || die '旧 Caddy 配置缺失。'
-      DOMAIN=$old
+      if [[ $kind == subscription ]]; then SUBSCRIPTION_DOMAIN=$old; else DOMAIN=$old; fi
       # Preserve the bind-mounted inode while restoring the exact old config.
       cat "$dir/old.Caddyfile" > "$ROOT/config/Caddyfile" || return 1
       for file in state progress; do
@@ -2665,35 +2782,39 @@ recover_caddy_domain() (
   esac
   caddy_domain_discard || return 1
   info '域名任务已完成恢复。'
-)
+}
 caddy_domain_apply() {
-  local dir=$ROOT/state/caddy-domain-change old
-  old=$(jq -er .old_domain "$dir/journal.json") || return 1
-  DOMAIN=$(jq -er .new_domain "$dir/journal.json") || return 1
-  valid_domain "$DOMAIN" || return 1
+  local dir=$ROOT/state/caddy-domain-change old new kind master subscription
+  old=$(jq -r .old_domain "$dir/journal.json") || return 1
+  new=$(jq -er .new_domain "$dir/journal.json") || return 1
+  kind=$(jq -r '.kind // "master"' "$dir/journal.json") || return 1
+  valid_domain "$new" || return 1
   caddy_domain_phase applying || return 1
   # Keep the old host working while the new certificate is issued.
-  render_caddy "$old, $DOMAIN" > "$dir/candidate.Caddyfile" || return 1
+  master=$DOMAIN subscription=$SUBSCRIPTION_DOMAIN
+  if [[ $kind == subscription ]]; then
+    subscription=$new
+    [[ -z $old ]] || subscription="$old, $new"
+  else master="$old, $new"; fi
+  render_caddy "$master" "$subscription" > "$dir/candidate.Caddyfile" || return 1
   cat "$dir/candidate.Caddyfile" > "$ROOT/config/Caddyfile" || return 1
   caddy_domain_reload || return 1
-  caddy_step '检查新域名证书与 HTTPS' caddy_domain_verify || return 1
-  render_caddy > "$dir/candidate.Caddyfile" || return 1
-  cat "$dir/candidate.Caddyfile" > "$ROOT/config/Caddyfile" || return 1
-  caddy_domain_reload && caddy_ready || return 1
-  caddy_domain_write_state && caddy_domain_phase committed
+  caddy_step '检查新域名证书与 HTTPS' caddy_domain_verify_new "$new" || return 1
+  if [[ -n $old ]]; then caddy_domain_phase awaiting-migration; else caddy_domain_phase finalizing; fi
 }
 change_caddy_domain() (
   set +x
-  local target=${1:-${CADDY_DOMAIN_TARGET:-}} dir=$ROOT/state/caddy-domain-change old new
+  local target=${1:-${CADDY_DOMAIN_TARGET:-}} kind=${2:-master} dir=$ROOT/state/caddy-domain-change old new label=主控
   caddy_require_install write
   caddy_require_idle
   caddy_token_pending_guard
   old=$DOMAIN
-  caddy_domain_stage || die '无法保存域名恢复记录，未修改配置。'
+  if [[ $kind == subscription ]]; then old=$SUBSCRIPTION_DOMAIN; label=订阅; fi
+  caddy_domain_stage "$kind" || die '无法保存域名恢复记录，未修改配置。'
   if ! caddy_domain_plan "$target"; then caddy_domain_discard; die '无法准备域名变更，未修改 DNS 或配置。'; fi
   new=$(jq -er .new_domain "$dir/journal.json") || return 1
   if [[ $new == "$old" ]]; then caddy_domain_discard; info '域名未变化。'; return 0; fi
-  if ! confirm "域名：$old → $new，成功后清理脚本创建的旧解析？"; then caddy_domain_discard; return 0; fi
+  if ! confirm "准备$label域名：${old:-未配置} → $new？"; then caddy_domain_discard; return 0; fi
   caddy_domain_phase dns || return 1
   if ! caddy_domain_ensure_dns; then
     recover_caddy_domain || die 'DNS 操作未完成，请用菜单 5 恢复。'
@@ -2704,9 +2825,17 @@ change_caddy_domain() (
     recover_caddy_domain || die '域名切换失败且恢复未完成，请用菜单 5 继续。'
     die '域名切换失败，已恢复旧域名。'
   fi
-  caddy_domain_cleanup_dns old || die '新域名已生效，旧 DNS 清理未完成；请用菜单 5 继续。'
-  caddy_domain_discard || die '新域名已生效，恢复记录清理失败。'
-  info "域名已变更：https://$new"
+  caddy_domain_finish || die '新域名已就绪，迁移清理未完成；请用菜单 5 继续。'
+)
+add_caddy_subscription() (
+  caddy_require_install write
+  [[ -z $SUBSCRIPTION_DOMAIN ]] || die '已配置订阅域名，请使用「切换订阅域名」。'
+  change_caddy_domain "${1:-${CADDY_DOMAIN_TARGET:-}}" subscription
+)
+change_caddy_subscription() (
+  caddy_require_install write
+  [[ -n $SUBSCRIPTION_DOMAIN ]] || die '尚未配置订阅域名，请先使用「新增订阅域名」。'
+  change_caddy_domain "${1:-${CADDY_DOMAIN_TARGET:-}}" subscription
 )
 resume_task() {
   if [[ -e $ROOT/state/caddy-domain-change ]]; then
@@ -2741,13 +2870,17 @@ resume_task() {
   fi
 }
 menu_header() {
-  local state=$ROOT/state/state.json version='未安装' domain='' task=''
+  local state=$ROOT/state/state.json version='未安装' domain='' subscription='' task=''
   [[ -f $state ]] || state=$ROOT/state.json
   if command -v jq >/dev/null && [[ -f $state ]]; then
     version=$(jq -r '.version // "未知"' "$state" 2>/dev/null) || version='未知'
     domain=$(jq -r '.domain // ""' "$state" 2>/dev/null) || domain=''
+    subscription=$(jq -r '.subscription_domain // ""' "$state" 2>/dev/null) || subscription=''
   fi
-  if [[ -e $ROOT/state/caddy-domain-change ]]; then task='域名变更待恢复';
+  if [[ -e $ROOT/state/caddy-domain-change ]]; then
+    task='域名变更待恢复'
+    if command -v jq >/dev/null && [[ -f $ROOT/state/caddy-domain-change/journal.json ]] &&
+      [[ $(jq -r .phase "$ROOT/state/caddy-domain-change/journal.json" 2>/dev/null) == awaiting-migration ]]; then task='域名待完成面板设置'; fi
   elif [[ -e $ROOT/state/caddy-token-change ]]; then task='Token 替换待恢复';
   elif [[ -f $ROOT/state/reinstall.json ]]; then task='镜像重装待继续';
   elif [[ -f $ROOT/state/image-rollback.json ]]; then task='版本切换待继续';
@@ -2756,6 +2889,7 @@ menu_header() {
   section "妙妙屋 X  ·  管理脚本 v$SCRIPT_VERSION"
   printf '  主控  %s\n' "$version"
   [[ -z $domain ]] || printf '  访问  https://%s\n' "$domain"
+  [[ -z $subscription ]] || printf '  订阅  https://%s\n' "$subscription"
   [[ -z $task ]] || printf '  任务  %s（菜单 5）\n' "$task"
   [[ -z $SCRIPT_UPDATE_VERSION ]] || printf '  脚本  发现新版本 %s（菜单 9 更新）\n' "$SCRIPT_UPDATE_VERSION"
   printf '\n'
@@ -2797,7 +2931,7 @@ main() {
   fi
   while (($#)); do
     case "$1" in
-      install|update|reinstall|uninstall|status|logs|log-menu|trace|trace-follow|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network|caddy|caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates|caddy-token|caddy-domain) ACTION=$1; shift;;
+      install|update|reinstall|uninstall|status|logs|log-menu|trace|trace-follow|resume|check|self-update|uninstall-script|rollback|firewall-apply|firewall-sync|confirm-network|caddy|caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates|caddy-token|caddy-domain|caddy-subscription-add|caddy-subscription-domain) ACTION=$1; shift;;
       --yes) ACCEPT=1; shift;;
       --domain|--prefix|--zone|--channel|--cf-token-file)
         [[ $# -ge 2 ]] || die "缺少参数：$1"
@@ -2810,16 +2944,16 @@ main() {
   [[ $EUID == 0 ]] || die '请使用 root 运行。'
   if [[ -z $ACTION ]]; then open_installed_menu; return; fi
   if [[ $ACTION == install ]]; then install_entry_guard; fi
-  case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token|caddy-domain) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
-  case "$ACTION" in install|update|reinstall|uninstall|resume|rollback|self-update|caddy-reload|caddy-restart|caddy-token|caddy-domain|check)
+  case "$ACTION" in install|update|reinstall|uninstall|resume|self-update|uninstall-script|rollback|caddy-reload|caddy-restart|caddy-token|caddy-domain|caddy-subscription-add|caddy-subscription-domain) exec 7>/run/mmwx-installer.lock; flock -n 7 || die '另一个安装或维护进程正在运行，请等待。';; esac
+  case "$ACTION" in install|update|reinstall|uninstall|resume|rollback|self-update|caddy-reload|caddy-restart|caddy-token|caddy-domain|caddy-subscription-add|caddy-subscription-domain|check)
     trace_start "$ACTION" || die '无法创建任务日志。';;
   esac
   if [[ -f $ROOT/state/docker-purge.json ]]; then
-    case "$ACTION" in install|update|reinstall|resume|rollback|caddy-reload|caddy-restart|caddy-token|caddy-domain)
+    case "$ACTION" in install|update|reinstall|resume|rollback|caddy-reload|caddy-restart|caddy-token|caddy-domain|caddy-subscription-add|caddy-subscription-domain)
       die '完全卸载尚未完成，请从菜单 10 继续。';;
     esac
   fi
-  case "$ACTION" in caddy-reload|caddy-restart|caddy-token|caddy-domain)
+  case "$ACTION" in caddy-reload|caddy-restart|caddy-token|caddy-domain|caddy-subscription-add|caddy-subscription-domain)
     caddy_require_install write; caddy_require_idle; caddy_token_pending_guard; caddy_lock_cf
     caddy_refresh_runtime || die '后台程序更新失败，未修改 Caddy。';;
   esac
@@ -2840,6 +2974,8 @@ main() {
     caddy) caddy_menu;;
     caddy-token) replace_caddy_token;;
     caddy-domain) change_caddy_domain;;
+    caddy-subscription-add) add_caddy_subscription;;
+    caddy-subscription-domain) change_caddy_subscription;;
     caddy-status|caddy-logs|caddy-reload|caddy-restart|caddy-certificates) caddy_action "${ACTION#caddy-}";;
   esac
 }

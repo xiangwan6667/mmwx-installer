@@ -2,6 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source ./install.sh
+# Keep the production renderer; controller fixtures override it below.
+eval "$(declare -f render_caddy | sed '1s/render_caddy/render_caddy_production/')"
 
 # Run as root on a disposable Linux Docker runner. Cloudflare calls are mocked;
 # configuration replacement, Caddy TLS, Compose and PostgreSQL are real.
@@ -265,3 +267,47 @@ grep -q '^ensure:rollback.example.com$' "$domain_dns_log"
 grep -q '^cleanup:new$' "$domain_dns_log"
 echo 'PASS: domain switch keeps real Caddy, app, database, credentials, data and certificates while serving the new SNI'
 echo 'PASS: failed domain candidate restores the committed domain and cleans only the staged DNS record'
+
+# Exercise production subscription routes with real TLS and a real upstream.
+# $path is expanded by the container's sh.
+# shellcheck disable=SC2016
+compose exec -T mmwx sh -c '
+  apk add --no-cache busybox-extras >/dev/null
+  mkdir -p /tmp/subscription-fixture/api/clash /tmp/subscription-fixture/api/user /tmp/subscription-fixture/api/fw/token /tmp/subscription-fixture/x
+  for path in api/clash/subscribe api/user/package-subscribe api/subscribe api/fw/token/ip x/short; do
+    printf retained-subscription > "/tmp/subscription-fixture/$path"
+  done
+  printf retained-gateway > /tmp/subscription-fixture/index.html
+  busybox-extras httpd -p 12889 -h /tmp/subscription-fixture
+'
+subscription_origin() {
+  curl --silent --show-error --noproxy '*' --connect-timeout 2 --max-time 5 \
+    --resolve "$1:443:127.0.0.1" -o "$ROOT/subscription-body" -w '%{http_code}' "https://$1$2"
+}
+subscription_reload() {
+  render_caddy_production "$DOMAIN" "$1" | python3 -c 'import re,sys
+config=sys.stdin.read()
+config=re.sub(r"  tls \{\s*dns cloudflare \{env.CF_API_TOKEN\}\s*resolvers 1.1.1.1 1.0.0.1\s*\}", "  tls internal", config)
+print(config)' > "$ROOT/subscription.Caddyfile"
+  cat "$ROOT/subscription.Caddyfile" > "$ROOT/config/Caddyfile"
+  caddy_domain_reload
+}
+subscription_reload mmw.example.com
+caddy_domain_ready_new mmw.example.com
+for path in /x/short /api/fw/token/ip /api/clash/subscribe /api/user/package-subscribe /api/subscribe; do
+  [[ $(subscription_origin mmw.example.com "$path") == 200 ]]
+  [[ $(cat "$ROOT/subscription-body") == retained-subscription ]]
+done
+for path in / /api/admin/users /api/subscribe/extra /api/clash/subscribe/extra /api/fw /x; do
+  [[ $(subscription_origin mmw.example.com "$path") == 404 ]]
+done
+subscription_reload 'mmw.example.com, next.example.com'
+caddy_domain_ready_new next.example.com
+[[ $(subscription_origin mmw.example.com /api/subscribe) == 200 ]]
+[[ $(subscription_origin next.example.com /api/subscribe) == 200 ]]
+subscription_reload next.example.com
+[[ $(subscription_origin next.example.com /api/subscribe) == 200 ]]
+[[ $(subscription_origin "$DOMAIN" /) == 200 ]]
+[[ $(compose ps -q caddy) == "${domain_before_id[caddy]}" ]]
+[[ $(docker inspect --format '{{.State.StartedAt}}' "$(compose ps -q caddy)") == "${domain_before_started[caddy]}" ]]
+echo 'PASS: production subscription renderer restricts real HTTPS paths and keeps dual hosts until final reload'

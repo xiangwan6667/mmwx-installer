@@ -114,6 +114,18 @@ reset_dns; caddy_domain_plan mmwx.example.net
 jq -e '.new_zone=="zone2" and .old_zone=="zone1"' "$ROOT/state/caddy-domain-change/journal.json" >/dev/null
 reset_dns; caddy_domain_plan old.example.com
 [[ ! -s $tmp/calls ]]
+# Subscription creation chooses mmw by default, needs no old DNS zone, and
+# rejects accidental use of the controller hostname before touching DNS.
+reset_dns
+caddy_domain_discard
+SUBSCRIPTION_DOMAIN=''
+caddy_domain_stage subscription
+caddy_domain_plan ''
+jq -e '.kind=="subscription" and .old_domain=="" and .new_domain=="mmw.example.com" and .new_zone=="zone1"' "$ROOT/state/caddy-domain-change/journal.json" >/dev/null
+[[ $(jq length "$ROOT/state/caddy-domain-change/old_records.json") == 0 ]]
+caddy_domain_cleanup_dns old
+if grep -q '^GET .*name=old.example.com' "$tmp/calls"; then echo 'Subscription add queried controller DNS for deletion'; exit 1; fi
+if caddy_domain_plan old.example.com; then echo 'Subscription accepted controller hostname'; exit 1; fi
 # Exercise the real HTTP boundary, including private headers and no write retries.
 (
   source ./install.sh

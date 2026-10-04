@@ -35,4 +35,13 @@ dc() {
 sync_cf > "$ROOT/screen" 2>&1
 if grep -q reload-details "$ROOT/screen"; then echo 'Caddy JSON leaked to screen'; exit 1; fi
 grep -q reload-details "$ROOT"/state/logs/*.log
+# The daily renderer reads subscription state instead of an empty shell global.
+rm "$ROOT/state.json"
+mkdir -p "$ROOT/config"
+printf '{"domain":"panel.example.com","subscription_domain":"mmw.example.com"}' > "$ROOT/state/state.json"
+SUBSCRIPTION_DOMAIN=''
+sync_cf > "$ROOT/screen" 2>&1
+grep -q '^panel.example.com {' "$ROOT/config/Caddyfile"
+grep -q '^mmw.example.com {' "$ROOT/config/Caddyfile"
+grep -q 'respond 404' "$ROOT/config/Caddyfile"
 echo 'PASS: CF synchronization reports lock failure, preserves caller flow and supports legacy layout'

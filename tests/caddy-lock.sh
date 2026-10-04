@@ -20,10 +20,12 @@ eval "$(declare -f caddy_refresh_runtime | sed 's|/usr/local/lib/mmwx-installer|
 eval "$(declare -f sync_cf | sed 's|/run/mmwx-cf.lock|$tmp/cf.lock|g')"
 flock() { printf '%s\n' "$*" >> "$tmp/locks"; [[ ${BUSY:-} != "${*: -1}" ]]; }
 caddy_action() { printf '%s\n' "$1" >> "$tmp/actions"; }
-for action in caddy-reload caddy-restart caddy-token caddy-domain; do
+for action in caddy-reload caddy-restart caddy-token caddy-domain caddy-subscription-add caddy-subscription-domain; do
   (
     replace_caddy_token() { echo token >> "$tmp/actions"; }
     change_caddy_domain() { echo domain >> "$tmp/actions"; }
+    add_caddy_subscription() { echo subscription-add >> "$tmp/actions"; }
+    change_caddy_subscription() { echo subscription-switch >> "$tmp/actions"; }
     : > "$tmp/locks"; : > "$tmp/actions"
     main "$action"
     [[ $(cat "$tmp/locks") == $'-n 7\n-w 180 8' ]]
