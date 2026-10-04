@@ -4,7 +4,7 @@
   <img src="assets/MeowX.png" alt="妙妙屋 X" height="180" />
 </div>
 
-本项目使用 Docker Compose 部署[妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，并配置 Cloudflare DNS、HTTPS 与源站访问防护。管理脚本版本为 **v0.3.1**。
+本项目使用 Docker Compose 部署[妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，并配置 Cloudflare DNS、HTTPS 与源站访问防护。管理脚本版本为 **v0.3.2**。
 
 ## 功能特性
 
