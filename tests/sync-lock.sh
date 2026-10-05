@@ -43,5 +43,4 @@ SUBSCRIPTION_DOMAIN=''
 sync_cf > "$ROOT/screen" 2>&1
 grep -q '^panel.example.com {' "$ROOT/config/Caddyfile"
 grep -q '^mmw.example.com {' "$ROOT/config/Caddyfile"
-grep -q 'respond 404' "$ROOT/config/Caddyfile"
 echo 'PASS: CF synchronization reports lock failure, preserves caller flow and supports legacy layout'

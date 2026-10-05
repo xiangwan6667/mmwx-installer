@@ -25,7 +25,10 @@ curl() {
       -o|--output) output=$2; shift 2;;
       -H|--header)
         header=$2
-        if [[ $header == @* ]] && grep -qx 'Authorization: Bearer fixture-anonymous-token' "${header#@}"; then token_header=1; fi
+        if [[ $header == @* ]]; then
+          if grep -qx 'Authorization: Bearer fixture-anonymous-token' "${header#@}"; then token_header=1; fi
+          if grep -qx 'Authorization: Bearer fixture-refreshed-token' "${header#@}"; then token_header=2; fi
+        fi
         shift 2;;
       -w|--write-out|--proto|--proto-redir|--tls-max|--connect-timeout|--max-time|--max-redirs|--retry|--max-filesize) shift 2;;
       https://*) url=$1; shift;;
@@ -33,14 +36,24 @@ curl() {
     esac
   done
   [[ -n $output ]] || { printf 'mock: response file missing\n' >&2; return 90; }
+  printf '%s\n' "$url" >> "$tmp/requests/urls"
   case "$url" in
     'https://ghcr.io/token?service=ghcr.io&scope=repository:iluobei/miaomiaowux:pull')
+      if [[ $rotate_token == 1 && $(grep -c '/token?' "$tmp/requests/urls") -gt 1 ]]; then
+        printf '{"token":"fixture-refreshed-token"}' > "$output"; printf 200; return 0
+      fi
       printf '%s' "$token_body" > "$output"; printf '%s' "$token_status"; return "$token_exit";;
     'https://ghcr.io/v2/iluobei/miaomiaowux/manifests/0.5.4')
       [[ $token_header == 1 ]] || return 91
       printf '%s' "$manifest_body" > "$output"
       if [[ $manifest_exit != 0 ]]; then printf 'curl: (28) fixture timeout\n' >&2; fi
       printf '%s' "$manifest_status"; return "$manifest_exit";;
+    'https://ghcr.io/v2/iluobei/miaomiaowux/manifests/0.5.3')
+      [[ $token_header != 0 ]] || return 91
+      if [[ $rotate_token == 1 && $token_header == 1 ]]; then
+        printf '{"errors":[{"code":"UNAUTHORIZED"}]}' > "$output"; printf 401; return 0
+      fi
+      printf '%s' "$index" > "$output"; printf 200; return 0;;
     "https://ghcr.io/v2/iluobei/miaomiaowux/blobs/$digest")
       [[ $token_header == 1 ]] || return 91
       printf '%s' "$config_body" > "$output"; printf '%s' "$config_status"; return 0;;
@@ -49,10 +62,11 @@ curl() {
 }
 
 reset_fixture() {
-  token_status=200 token_exit=0 manifest_status=200 manifest_exit=0 config_status=200
+  token_status=200 token_exit=0 manifest_status=200 manifest_exit=0 config_status=200 rotate_token=0
   token_body='{"token":"fixture-anonymous-token"}'
   manifest_body=$index config_body=$config machine=x86_64
   : > "$tmp/requests/arguments"
+  : > "$tmp/requests/urls"
 }
 expect_status() {
   local expected=$1 label=$2 version=${3-v0.5.4} actual=0
@@ -60,7 +74,7 @@ expect_status() {
   [[ $actual == "$expected" ]] || { printf 'FAIL: %s: expected %s, got %s\n' "$label" "$expected" "$actual"; cat "$tmp/stderr"; exit 1; }
   [[ $VERSION == v99 && $APP_IMAGE == installed@sha256:unchanged ]] || { echo 'FAIL: checker changed selected image'; exit 1; }
   [[ -z $(find "$TMPDIR" -mindepth 1 -print -quit) ]] || { echo 'FAIL: token temporary files remain'; exit 1; }
-  if grep -R -q 'fixture-anonymous-token' "$tmp/stdout" "$tmp/stderr" "$tmp/requests" "$ROOT/state/logs" 2>/dev/null; then
+  if grep -R -q 'fixture-\(anonymous\|refreshed\)-token' "$tmp/stdout" "$tmp/stderr" "$tmp/requests" "$ROOT/state/logs" 2>/dev/null; then
     echo 'FAIL: token leaked into output, curl arguments or logs'; exit 1
   fi
 }
@@ -100,4 +114,30 @@ reset_fixture; manifest_body=$(jq '.config.digest="../invalid"' <<<"$single"); e
 reset_fixture; machine=riscv64; expect_status 20 'unsupported host'; [[ ! -s $tmp/requests/arguments ]]
 reset_fixture; expect_status 20 'invalid version' '../0.5.4'; [[ ! -s $tmp/requests/arguments ]]
 reset_fixture; expect_status 20 'empty version' ''; [[ ! -s $tmp/requests/arguments ]]
+
+# A single selection must share authorization while checking each candidate live.
+pages='[{"tag_name":"v0.5.4","prerelease":false,"draft":false,"published_at":"2026-10-04"},{"tag_name":"v0.5.3","prerelease":false,"draft":false,"published_at":"2026-10-03"}]'
+ask() { printf y; }
+reset_fixture; manifest_status=404; manifest_body=$missing_body
+CHANNEL=stable VERSION=v0.5.4
+select_available_image "$pages" latest > "$tmp/selection-output"
+[[ $VERSION == v0.5.3 ]] || { echo 'FAIL: fallback selection changed'; exit 1; }
+[[ $(grep -c '/token?' "$tmp/requests/urls") == 1 ]] || { echo 'FAIL: each candidate fetched authorization again'; exit 1; }
+[[ $(grep -c '/manifests/' "$tmp/requests/urls") == 2 ]] || { echo 'FAIL: candidate manifests were not checked live'; exit 1; }
+[[ -z $(find "$TMPDIR" -mindepth 1 -print -quit) ]] || { echo 'FAIL: selection left token files'; exit 1; }
+
+# Authorization is discarded when a selection finishes; no stale image result is cached.
+VERSION=v0.5.4
+select_available_image "$pages" latest > "$tmp/selection-output"
+[[ $(grep -c '/token?' "$tmp/requests/urls") == 2 && $(grep -c '/manifests/' "$tmp/requests/urls") == 4 ]] || { echo 'FAIL: independent selection reused stale authorization or manifests'; exit 1; }
+
+# A reused token can expire during a prompt; refresh once and retry the same candidate.
+reset_fixture; manifest_status=404; manifest_body=$missing_body; rotate_token=1
+CHANNEL=stable VERSION=v0.5.4
+select_available_image "$pages" latest > "$tmp/selection-output"
+[[ $VERSION == v0.5.3 && $(grep -c '/token?' "$tmp/requests/urls") == 2 && $(grep -c '/manifests/0.5.3' "$tmp/requests/urls") == 2 ]] || { echo 'FAIL: expired authorization did not refresh the same candidate'; exit 1; }
+if grep -R -q 'fixture-\(anonymous\|refreshed\)-token' "$tmp/selection-output" "$tmp/requests" "$ROOT/state/logs" 2>/dev/null; then
+  echo 'FAIL: session token leaked into arguments or logs'; exit 1
+fi
+[[ -z $(find "$TMPDIR" -mindepth 1 -print -quit) ]] || { echo 'FAIL: refresh left token files'; exit 1; }
 echo 'PASS: registry availability, host platforms, error separation, token privacy and cleanup'

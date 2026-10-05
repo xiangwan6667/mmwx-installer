@@ -273,11 +273,14 @@ echo 'PASS: failed domain candidate restores the committed domain and cleans onl
 # shellcheck disable=SC2016
 compose exec -T mmwx sh -c '
   apk add --no-cache busybox-extras >/dev/null
-  mkdir -p /tmp/subscription-fixture/api/clash /tmp/subscription-fixture/api/user /tmp/subscription-fixture/api/fw/token /tmp/subscription-fixture/x
+  mkdir -p /tmp/subscription-fixture/api/clash /tmp/subscription-fixture/api/user /tmp/subscription-fixture/api/fw/token /tmp/subscription-fixture/x /tmp/subscription-fixture/assets
   for path in api/clash/subscribe api/user/package-subscribe api/subscribe api/fw/token/ip x/short; do
     printf retained-subscription > "/tmp/subscription-fixture/$path"
   done
   printf retained-gateway > /tmp/subscription-fixture/index.html
+  for path in login assets/app.js api/user/info; do
+    printf retained-panel > "/tmp/subscription-fixture/$path"
+  done
   busybox-extras httpd -p 12889 -h /tmp/subscription-fixture
 '
 subscription_origin() {
@@ -294,12 +297,41 @@ print(config)' > "$ROOT/subscription.Caddyfile"
 }
 subscription_reload mmw.example.com
 caddy_domain_ready_new mmw.example.com
+# Load the exact v0.3.2 guard, then exercise the production migration live.
+python3 - "$ROOT/config/Caddyfile" > "$ROOT/legacy-subscription.Caddyfile" <<'PY'
+from pathlib import Path
+import sys
+config = Path(sys.argv[1]).read_text()
+proxy = '  reverse_proxy mmwx:12889\n'
+legacy = '''  @subscriptions {
+    path /x/* /api/fw/* /api/clash/subscribe /api/user/package-subscribe /api/subscribe
+  }
+  handle @subscriptions {
+    reverse_proxy mmwx:12889
+  }
+  handle {
+    respond 404
+  }
+'''
+offset = config.rindex(proxy)
+sys.stdout.write(config[:offset] + legacy + config[offset+len(proxy):])
+PY
+cat "$ROOT/legacy-subscription.Caddyfile" > "$ROOT/config/Caddyfile"
+caddy_domain_reload
+[[ $(subscription_origin mmw.example.com /) == 404 ]]
+SUBSCRIPTION_DOMAIN=mmw.example.com
+caddy_reload_config > "$ROOT/subscription-migration-output" 2>&1
+cmp "$ROOT/legacy-subscription.Caddyfile" "$ROOT/state/Caddyfile-before-subscription-panel"
+[[ $(subscription_origin mmw.example.com /) == 200 ]]
 for path in /x/short /api/fw/token/ip /api/clash/subscribe /api/user/package-subscribe /api/subscribe; do
   [[ $(subscription_origin mmw.example.com "$path") == 200 ]]
   [[ $(cat "$ROOT/subscription-body") == retained-subscription ]]
 done
-for path in / /api/admin/users /api/subscribe/extra /api/clash/subscribe/extra /api/fw /x; do
-  [[ $(subscription_origin mmw.example.com "$path") == 404 ]]
+[[ $(subscription_origin mmw.example.com /) == 200 ]]
+[[ $(cat "$ROOT/subscription-body") == retained-gateway ]]
+for path in /login /assets/app.js /api/user/info; do
+  [[ $(subscription_origin mmw.example.com "$path") == 200 ]]
+  [[ $(cat "$ROOT/subscription-body") == retained-panel ]]
 done
 subscription_reload 'mmw.example.com, next.example.com'
 caddy_domain_ready_new next.example.com
@@ -310,4 +342,4 @@ subscription_reload next.example.com
 [[ $(subscription_origin "$DOMAIN" /) == 200 ]]
 [[ $(compose ps -q caddy) == "${domain_before_id[caddy]}" ]]
 [[ $(docker inspect --format '{{.State.StartedAt}}' "$(compose ps -q caddy)") == "${domain_before_started[caddy]}" ]]
-echo 'PASS: production subscription renderer restricts real HTTPS paths and keeps dual hosts until final reload'
+echo 'PASS: production subscription renderer serves the panel over HTTPS and keeps dual hosts until final reload'

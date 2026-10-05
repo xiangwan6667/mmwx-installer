@@ -24,6 +24,69 @@ caddy_action status > "$tmp/status"
 grep -q 'v2.11.4' "$tmp/status" || fail 'Caddy status omits installed version'
 printf '%s\n' 'ps caddy' 'exec -T caddy caddy version' > "$tmp/expected"
 cmp "$ROOT/calls" "$tmp/expected"
+
+# A legacy subscription-only site is upgraded by reload, preserving all other text.
+(
+  SUBSCRIPTION_DOMAIN=subscription.example.com
+  cat > "$ROOT/config/Caddyfile" <<'LEGACY'
+{
+  admin off
+}
+panel.example.com {
+  reverse_proxy mmwx:12889
+}
+subscription.example.com {
+  tls internal
+  @subscriptions {
+    path /x/* /api/fw/* /api/clash/subscribe /api/user/package-subscribe /api/subscribe
+  }
+  handle @subscriptions {
+    reverse_proxy mmwx:12889
+  }
+  handle {
+    respond 404
+  }
+}
+LEGACY
+  cp "$ROOT/config/Caddyfile" "$tmp/legacy.Caddyfile"
+  caddy_ready() { :; }
+  caddy_action reload > "$tmp/subscription-reload"
+  if grep -q 'respond 404' "$ROOT/config/Caddyfile"; then fail 'Reload kept the legacy panel block'; fi
+  grep -q 'admin off' "$ROOT/config/Caddyfile" || fail 'Migration changed custom global settings'
+  cmp "$tmp/legacy.Caddyfile" "$ROOT/state/Caddyfile-before-subscription-panel" || fail 'Migration backup missing'
+  cp "$ROOT/config/Caddyfile" "$tmp/migrated.Caddyfile"
+  caddy_action reload >/dev/null
+  cmp "$tmp/migrated.Caddyfile" "$ROOT/config/Caddyfile" || fail 'Repeat reload changed configuration'
+  cmp "$tmp/legacy.Caddyfile" "$ROOT/state/Caddyfile-before-subscription-panel" || fail 'Repeat reload overwrote the original backup'
+
+  cat "$tmp/legacy.Caddyfile" > "$ROOT/config/Caddyfile"
+  VALIDATE_RC=1
+  if caddy_action reload > "$tmp/migration-failed" 2>&1; then fail 'Invalid panel config accepted'; fi
+  cmp "$tmp/legacy.Caddyfile" "$ROOT/config/Caddyfile" || fail 'Failed migration did not restore the legacy file'
+  VALIDATE_RC=0
+  caddy_ready() { return 1; }
+  : > "$ROOT/calls"
+  if caddy_action reload > "$tmp/migration-not-ready" 2>&1; then fail 'Unready panel config accepted'; fi
+  cmp "$tmp/legacy.Caddyfile" "$ROOT/config/Caddyfile" || fail 'Failed readiness did not restore the legacy file'
+  [[ $(grep -c '^exec -T caddy caddy reload' "$ROOT/calls") == 2 ]] || fail 'Failed readiness did not reload the original config'
+  caddy_ready() { :; }
+  cat() {
+    if [[ ${1:-} == */new.Caddyfile ]]; then command head -c 30 "$1"; return 1; fi
+    command cat "$@"
+  }
+  if caddy_action reload > "$tmp/migration-partial-write" 2>&1; then fail 'Partial panel config write accepted'; fi
+  cmp "$tmp/legacy.Caddyfile" "$ROOT/config/Caddyfile" || fail 'Failed write did not restore the legacy file'
+)
+
+# An unchanged custom subscription site must not be regenerated during reload.
+(
+  SUBSCRIPTION_DOMAIN=subscription.example.com
+  printf 'subscription.example.com {\n  respond "custom-page" 200\n}\n' > "$ROOT/config/Caddyfile"
+  cp "$ROOT/config/Caddyfile" "$tmp/custom.Caddyfile"
+  caddy_ready() { :; }
+  caddy_action reload >/dev/null
+  cmp "$tmp/custom.Caddyfile" "$ROOT/config/Caddyfile" || fail 'Reload rewrote a custom site'
+)
 : > "$ROOT/calls"
 (
   VALIDATE_RC=1
@@ -87,12 +150,17 @@ CHILD
 # A failed origin check must still report the edge and independent public HTTP status.
 (
   # shellcheck disable=SC2317,SC2329
-  caddy_certificate_probe() { printf 'fixture %s\n' "$1"; [[ $1 == edge ]]; }
-  curl() { printf '%s\n' "$*" > "$tmp/curl-call"; printf 503; }
+  caddy_certificate_probe() { printf 'fixture %s %s\n' "$1" "$3"; [[ $1 == edge ]]; }
+  curl() { printf '%s\n' "$*" >> "$tmp/curl-call"; printf 503; }
+  : > "$tmp/curl-call"
+  SUBSCRIPTION_DOMAIN=subscription.example.com
   if caddy_action certificates > "$tmp/certificates"; then fail 'Failed origin probe reported success'; fi
-  grep -q 'fixture origin' "$tmp/certificates"; grep -q 'fixture edge' "$tmp/certificates"
+  grep -q 'fixture origin panel.example.com' "$tmp/certificates"; grep -q 'fixture edge panel.example.com' "$tmp/certificates"
+  grep -q 'fixture origin subscription.example.com' "$tmp/certificates" || fail 'Subscription origin certificate was not checked'
+  grep -q 'fixture edge subscription.example.com' "$tmp/certificates" || fail 'Subscription edge certificate was not checked'
   grep -q 'HTTP 503' "$tmp/certificates"
   grep -q 'https://panel.example.com/' "$tmp/curl-call"
+  grep -q 'https://subscription.example.com/' "$tmp/curl-call" || fail 'Subscription panel HTTPS was not checked'
   if grep -Eq 'Authorization|--header|--resolve|--insecure' "$tmp/curl-call"; then fail 'Public HTTPS status bypasses trust or carries credentials'; fi
 )
 

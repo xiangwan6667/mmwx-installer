@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 ROOT=/opt/mmwx-installer
 UPSTREAM=iluobei/miaomiaowuX
-SCRIPT_VERSION=0.3.2
+SCRIPT_VERSION=0.3.3
 SCRIPT_UPDATE_CHECKED=0 SCRIPT_UPDATE_VERSION=''
 CHANNEL='' DOMAIN='' SUBSCRIPTION_DOMAIN='' PREFIX='' ZONE_NAME='' TOKEN_FILE='' ACTION='' ACCEPT=0 TEMP_TOKEN='' CHANNEL_EXPLICIT=0 STAGE=0 VERSION=''
 APP_IMAGE='' CADDY_IMAGE='' PG_IMAGE=postgres:18-alpine
@@ -446,15 +446,7 @@ $subscription {
     dns cloudflare {env.CF_API_TOKEN}
     resolvers 1.1.1.1 1.0.0.1
   }
-  @subscriptions {
-    path /x/* /api/fw/* /api/clash/subscribe /api/user/package-subscribe /api/subscribe
-  }
-  handle @subscriptions {
-    reverse_proxy mmwx:12889
-  }
-  handle {
-    respond 404
-  }
+  reverse_proxy mmwx:12889
 }
 EOF
 }
@@ -587,9 +579,21 @@ select_version_menu() {
 }
 # 0: published for this host; 10: missing tag/repository; 11: missing platform;
 # 20: check failed (transport, access, rate limit or invalid registry response).
-check_app_image() (
+check_app_image() {
+  # The caller owns this in-memory authorization for one selection only.
+  # Disable tracing before receiving or assigning credentials from the probe.
+  local traced=0
+  if [[ $- == *x* ]]; then traced=1; set +x; fi
+  local status=0 authorization=''
+  authorization=$(check_app_image_probe "${1:-}") || status=$?
+  if [[ ${IMAGE_CHECK_AUTHORIZATION+x} ]]; then IMAGE_CHECK_AUTHORIZATION=$authorization; fi
+  unset authorization
+  if [[ $traced == 1 ]]; then set -x; fi
+  return "$status"
+}
+check_app_image_probe() (
   set +x
-  local version=${1:-} arch dir logfile status token kind digest
+  local version=${1:-} arch dir logfile status token kind digest reused=0 probe_exit
   local base=https://ghcr.io/v2/iluobei/miaomiaowux
   local accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
   [[ $version =~ ^v?[0-9][A-Za-z0-9._-]*$ && ${#version} -le 128 ]] || return 20
@@ -597,7 +601,8 @@ check_app_image() (
   mkdir -p "$ROOT/state/logs" || return 20
   logfile=$ROOT/state/logs/image-check.log
   dir=$(mktemp -d) || return 20
-  trap 'rm -rf "$dir"' EXIT
+  # Only the wrapper receives this header; temporary files are always removed.
+  trap 'probe_exit=$?; if [[ $probe_exit == 0 || $probe_exit == 10 || $probe_exit == 11 ]]; then cat "$dir/headers"; fi; rm -rf "$dir"' EXIT
   printf 'Version %s; platform linux/%s\n' "$version" "$arch" >> "$logfile" || return 20
   # Keep registry credentials out of process arguments, output and persistent logs.
   image_check_request() {
@@ -618,12 +623,28 @@ check_app_image() (
     printf '  镜像检查未完成：%s；日志：%s\n' "$1" "$logfile" >&2
     return 20
   }
-  image_check_request token 'https://ghcr.io/token?service=ghcr.io&scope=repository:iluobei/miaomiaowux:pull' || return 20
-  [[ $status == 200 ]] || { image_check_error 'GHCR 授权请求失败'; return 20; }
-  token=$(jq -ers 'select(length==1) | .[0] | (.token // .access_token) | select(type=="string" and test("^[A-Za-z0-9._~+/-]+=*$"))' "$dir/body" 2>/dev/null) || { image_check_error 'GHCR 授权响应异常'; return 20; }
-  printf 'Authorization: Bearer %s\n' "$token" > "$dir/headers" || return 20
-  unset token
-  image_check_request manifest "$base/manifests/${version#v}" -H "@$dir/headers" -H "Accept: $accept" || return 20
+  image_check_authorize() {
+    image_check_request token 'https://ghcr.io/token?service=ghcr.io&scope=repository:iluobei/miaomiaowux:pull' || return 20
+    [[ $status == 200 ]] || { image_check_error 'GHCR 授权请求失败'; return 20; }
+    token=$(jq -ers 'select(length==1) | .[0] | (.token // .access_token) | select(type=="string" and test("^[A-Za-z0-9._~+/-]+=*$"))' "$dir/body" 2>/dev/null) || { image_check_error 'GHCR 授权响应异常'; return 20; }
+    printf 'Authorization: Bearer %s\n' "$token" > "$dir/headers" || return 20
+    unset token
+  }
+  image_check_authenticated_request() {
+    image_check_request "$@" || return 20
+    if [[ $status == 401 && $reused == 1 ]]; then
+      reused=0
+      image_check_authorize || return 20
+      image_check_request "$@" || return 20
+    fi
+  }
+  if [[ -n ${IMAGE_CHECK_AUTHORIZATION:-} ]]; then
+    printf '%s\n' "$IMAGE_CHECK_AUTHORIZATION" > "$dir/headers" || return 20
+    reused=1
+  else
+    image_check_authorize || return 20
+  fi
+  image_check_authenticated_request manifest "$base/manifests/${version#v}" -H "@$dir/headers" -H "Accept: $accept" || return 20
   if [[ $status == 404 ]] && jq -es 'length==1 and (.[0] | (.errors|type=="array" and length>0) and all(.errors[]; .code=="MANIFEST_UNKNOWN" or .code=="NAME_UNKNOWN"))' "$dir/body" >/dev/null 2>&1; then return 10; fi
   [[ $status == 200 ]] || { image_check_error 'GHCR 镜像查询失败'; return 20; }
   kind=$(jq -ers 'select(length==1) | .[0] | select(.schemaVersion==2) | .mediaType | select(type=="string")' "$dir/body" 2>/dev/null) || { image_check_error '镜像清单格式异常'; return 20; }
@@ -640,7 +661,7 @@ check_app_image() (
       digest=$(jq -er 'select((.layers|type=="array") and
         (.config.mediaType=="application/vnd.oci.image.config.v1+json" or .config.mediaType=="application/vnd.docker.container.image.v1+json") and
         (.config.size|type=="number" and .>=0)) | .config.digest | select(type=="string" and test("^sha256:[a-f0-9]{64}$"))' "$dir/body" 2>/dev/null) || { image_check_error '镜像配置描述异常'; return 20; }
-      image_check_request config "$base/blobs/$digest" -H "@$dir/headers" || return 20
+      image_check_authenticated_request config "$base/blobs/$digest" -H "@$dir/headers" || return 20
       [[ $status == 200 ]] || { image_check_error '镜像配置查询失败'; return 20; }
       jq -es 'length==1 and (.[0] | (.os|type=="string" and length>0) and (.architecture|type=="string" and length>0))' "$dir/body" >/dev/null 2>&1 || { image_check_error '镜像架构配置异常'; return 20; }
       if jq -e --arg arch "$arch" '.os=="linux" and .architecture==$arch' "$dir/body" >/dev/null; then return 0; fi
@@ -700,6 +721,7 @@ image_unavailable_notice() {
 }
 select_available_image() {
   local pages=$1 mode=$2 operation=${3:-install} current=${4:-} status candidate choice
+  local IMAGE_CHECK_AUTHORIZATION=''
   while true; do
     version_allowed "$operation" "$current" "$VERSION" || return 1
     info "检查主控 $VERSION 镜像……"
@@ -2054,6 +2076,64 @@ caddy_step() (
 caddy_validate_config() {
   caddy_step '校验 Caddy 配置' dc exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 }
+caddy_reload_config() (
+  local staged='' changed=0 reload_attempted=0 reload_exit
+  # Called by the EXIT trap, including error and signal paths.
+  # shellcheck disable=SC2317,SC2329
+  caddy_reload_cleanup() {
+    reload_exit=$?
+    if [[ $reload_exit != 0 && $changed == 1 ]]; then
+      if ! cat "$staged/old.Caddyfile" > "$ROOT/config/Caddyfile"; then
+        printf '原 Caddy 配置恢复失败；备份：%s\n' "$ROOT/state/Caddyfile-before-subscription-panel" >&2
+      elif [[ $reload_attempted == 1 ]]; then
+        caddy_step '恢复原 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile ||
+          printf '原 Caddy 配置已恢复，重载未完成，请重试菜单 3。\n' >&2
+      fi
+    fi
+    [[ -z $staged ]] || rm -rf -- "$staged"
+  }
+  trap caddy_reload_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [[ -n $SUBSCRIPTION_DOMAIN ]]; then
+    staged=$(mktemp -d "$ROOT/state/.caddy-panel-reload.XXXXXX") || return 1
+    cp "$ROOT/config/Caddyfile" "$staged/old.Caddyfile" || return 1
+    # Upgrade only the exact legacy block for the recorded subscription host.
+    # Preserve custom settings and other sites instead of regenerating the file.
+    python3 - "$ROOT/config/Caddyfile" "$SUBSCRIPTION_DOMAIN" > "$staged/new.Caddyfile" <<'PY' || return 1
+from pathlib import Path
+import re, sys
+raw = Path(sys.argv[1]).read_bytes().decode('utf-8')
+domain = sys.argv[2]
+legacy = '''  @subscriptions {
+    path /x/* /api/fw/* /api/clash/subscribe /api/user/package-subscribe /api/subscribe
+  }
+  handle @subscriptions {
+    reverse_proxy mmwx:12889
+  }
+  handle {
+    respond 404
+  }
+'''
+site = re.search(r'(?m)^' + re.escape(domain) + r' \{\n.*?^\}\n', raw, re.S)
+if site and legacy in site[0]:
+    replacement = site[0].replace(legacy, '  reverse_proxy mmwx:12889\n', 1)
+    raw = raw[:site.start()] + replacement + raw[site.end():]
+sys.stdout.buffer.write(raw.encode('utf-8'))
+PY
+    if ! cmp -s "$staged/old.Caddyfile" "$staged/new.Caddyfile"; then
+      install -m 0600 "$staged/old.Caddyfile" "$ROOT/state/Caddyfile-before-subscription-panel" || return 1
+      changed=1
+      cat "$staged/new.Caddyfile" > "$ROOT/config/Caddyfile" || return 1
+    fi
+  fi
+  caddy_validate_config || return 1
+  reload_attempted=1
+  caddy_step '重载 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile || return 1
+  caddy_ready || return 1
+  if [[ $changed == 1 ]]; then caddy_domain_ready_new "$SUBSCRIPTION_DOMAIN" || return 1; fi
+  [[ $changed == 0 ]] || info "订阅域名已启用用户面板：https://$SUBSCRIPTION_DOMAIN/"
+)
 caddy_ready() {
   python3 - "$ROOT" "$DOMAIN" "${1:-60}" <<'PY'
 import socket, ssl, subprocess, sys, time
@@ -2182,9 +2262,7 @@ caddy_action() {
       caddy_redacted_command dc exec -T caddy caddy version;;
     logs) caddy_redacted_command dc logs --tail 80 caddy;;
     reload)
-      caddy_validate_config || return $?
-      caddy_step '重载 Caddy 配置' dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile || return $?
-      caddy_ready;;
+      caddy_reload_config;;
     restart)
       confirm '重启 Caddy？HTTPS 访问将短暂中断。' || return 0
       caddy_step '重启 Caddy' dc restart caddy || return $?
@@ -2193,12 +2271,26 @@ caddy_action() {
     certificates)
       caddy_redacted_command caddy_certificate_probe origin 127.0.0.1 "$DOMAIN" || result=1
       caddy_redacted_command caddy_certificate_probe edge "$DOMAIN" "$DOMAIN" || result=1
+      if [[ -n $SUBSCRIPTION_DOMAIN ]]; then
+        printf '\n  订阅域名证书：%s\n' "$SUBSCRIPTION_DOMAIN"
+        caddy_redacted_command caddy_certificate_probe origin 127.0.0.1 "$SUBSCRIPTION_DOMAIN" || result=1
+        caddy_redacted_command caddy_certificate_probe edge "$SUBSCRIPTION_DOMAIN" "$SUBSCRIPTION_DOMAIN" || result=1
+      fi
       printf '\n  公网 HTTPS 状态（独立于源站证书检查）：\n'
       if http_status=$(curl --proto '=https' --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' "https://$DOMAIN/" 2>/dev/null); then
         printf '  HTTP %s\n' "$http_status"
       else
         printf '  公网 HTTPS 连接失败。\n'
         result=1
+      fi
+      if [[ -n $SUBSCRIPTION_DOMAIN ]]; then
+        if http_status=$(curl --proto '=https' --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' "https://$SUBSCRIPTION_DOMAIN/" 2>/dev/null); then
+          printf '  订阅域名 HTTPS HTTP %s\n' "$http_status"
+          [[ $http_status =~ ^[23][0-9][0-9]$ ]] || result=1
+        else
+          printf '  订阅域名 HTTPS 连接失败。\n'
+          result=1
+        fi
       fi
       return "$result";;
   esac
@@ -2245,7 +2337,7 @@ caddy-domain 选择新主域名及前缀；也可用 --zone example.com --prefix
 新证书与反代就绪后，到面板「系统设置 → 系统」迁移域名，确认完成后清理旧域名。
 caddy-subscription-add 新增独立订阅域名，前缀默认 mmw。
 caddy-subscription-domain 切换订阅域名；也可用 --zone example.com --prefix mmw。
-订阅域名仅开放订阅路径；到「系统设置 → 系统」更新订阅域名后确认清理旧域名。
+订阅域名是独立的用户面板入口，完整反代妙妙屋；到「系统设置 → 系统」更新订阅域名后确认清理旧域名。
 暂未完成面板设置或任务中断时，用菜单 5 继续。
 caddy-status / caddy-logs / caddy-reload / caddy-restart / caddy-certificates 可直接执行。
 EOF
@@ -2674,11 +2766,9 @@ caddy_domain_verify() {
   kind=$(jq -r '.kind // "master"' "$ROOT/state/caddy-domain-change/journal.json") || return 1
   for ((attempt=0; attempt<6; attempt++)); do
     if [[ $kind == subscription ]]; then
-      # A subscription-only host deliberately returns 404 at /. Never bypass TLS.
+      # The subscription domain is an independent panel entrypoint.
       if code=$(curl -q --proto '=https' --noproxy '*' -sS --connect-timeout 3 --max-time 10 \
-        "https://$DOMAIN/" -o /dev/null -w '%{http_code}') && [[ $code == 404 ]] &&
-        code=$(curl -q --proto '=https' --noproxy '*' -sS --connect-timeout 3 --max-time 10 \
-          "https://$DOMAIN/api/subscribe" -o /dev/null -w '%{http_code}') && [[ $code =~ ^[234][0-9][0-9]$ ]]; then return 0; fi
+        "https://$DOMAIN/" -o /dev/null -w '%{http_code}') && [[ $code =~ ^[23][0-9][0-9]$ ]]; then return 0; fi
     elif curl -q --proto '=https' --proto-redir '=https' --noproxy '*' \
       -fsS --connect-timeout 3 --max-time 10 "https://$DOMAIN/" -o /dev/null; then return 0; fi
     sleep 2

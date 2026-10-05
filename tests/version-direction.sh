@@ -83,7 +83,7 @@ grep -q '没有符合方向' "$tmp/output"
 ROOT=$tmp/root; mkdir -p "$ROOT/state" "$ROOT/config"
 preflight() { :; }
 load_state() { VERSION=v2; APP_IMAGE=old; }
-choose_version() { VERSION=$selected_target; APP_IMAGE=changed-digest; }
+choose_version() { VERSION=$selected_target; APP_IMAGE='changed-digest'; }
 pull_app_version() { echo pull >> "$tmp/mutations"; }
 install_command() { echo command >> "$tmp/mutations"; }
 configure_timezone() { echo timezone >> "$tmp/mutations"; }

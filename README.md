@@ -4,7 +4,7 @@
   <img src="assets/MeowX.png" alt="妙妙屋 X" height="180" />
 </div>
 
-本项目使用 Docker Compose 部署[妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，并配置 Cloudflare DNS、HTTPS 与源站访问防护。管理脚本版本为 **v0.3.2**。
+本项目使用 Docker Compose 部署[妙妙屋 X](https://github.com/iluobei/miaomiaowuX)、PostgreSQL 18 和 Caddy，并配置 Cloudflare DNS、HTTPS 与源站访问防护。管理脚本版本为 **v0.3.3**。
 
 ## 功能特性
 
@@ -108,7 +108,7 @@ mmwx logs          # 最近 80 行服务日志
 
 ### Caddy 域名与 Token
 
-运行 `mmwx caddy` 或选择菜单 8，可查看状态与日志、校验并重载配置、重启 Caddy、检查 HTTPS、更换 Token、变更主控域名，以及新增或切换独立订阅域名。证书检查分别显示本机源站与 Cloudflare 边缘证书的签发者、到期时间和剩余天数。
+运行 `mmwx caddy` 或选择菜单 8，可查看状态与日志、校验并重载配置、重启 Caddy、检查 HTTPS、更换 Token、变更主控域名，以及新增或切换独立订阅域名。证书检查分别显示主控与订阅域名的本机源站、Cloudflare 边缘证书，以及公网 HTTPS 状态。
 
 更换 Token 可在菜单中隐藏输入，也可从权限为 `600`、由 root 所有的文件读取：
 
@@ -139,7 +139,9 @@ mmwx caddy-subscription-add --zone example.com --prefix mmw
 
 订阅域名与主控域名分别保存，不能使用同一个域名。脚本自动配置 DNS、证书和反代，新增后按提示到面板 **系统设置 → 系统 → 订阅域名** 填写完整地址（如 `https://mmw.example.com`）并保存。切换时先保留新旧订阅域名，确认面板设置已更新、订阅正常后才清理旧域名；暂未完成可从主菜单 5 继续。
 
-按照[官方订阅域名文档](https://miaomiaowux.com/docs/domain-subscription/)，订阅域名仅放行 `/x/*`、`/api/fw/*`、`/api/clash/subscribe`、`/api/user/package-subscribe` 和 `/api/subscribe`，其余路径返回 404。
+订阅域名是独立的用户面板入口，完整反代妙妙屋，用户可以直接打开 `https://mmw.example.com/` 登录和使用面板；订阅链接、客户端上报和面板接口通过该域名访问。
+
+已使用 v0.3.2 添加订阅域名、首页返回 404 时，先更新管理脚本，再执行 `mmwx caddy-reload`（Caddy 子菜单 3）。脚本会将原版订阅路径限制改为完整面板反代，原配置保存为 `/opt/mmwx-installer/state/Caddyfile-before-subscription-panel`，校验或重载失败时恢复原配置。
 
 ## 数据与恢复
 

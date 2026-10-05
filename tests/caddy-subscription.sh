@@ -29,8 +29,6 @@ add_caddy_subscription > "$tmp/output"
 [[ $(jq -r .subscription_domain "$ROOT/state/progress.json") == mmw.example.com ]]
 grep -q '^panel.example.com {' "$ROOT/config/Caddyfile"
 grep -q '^mmw.example.com {' "$ROOT/config/Caddyfile"
-grep -q 'path /x/\* /api/fw/\* /api/clash/subscribe /api/user/package-subscribe /api/subscribe' "$ROOT/config/Caddyfile"
-grep -q 'respond 404' "$ROOT/config/Caddyfile"
 grep -q '系统设置.*系统.*订阅域名' "$tmp/output"
 [[ ! -e $ROOT/state/caddy-domain-change ]]
 if (add_caddy_subscription other.example.com) >/dev/null 2>&1; then echo 'Add silently replaced existing subscription'; exit 1; fi
@@ -60,7 +58,7 @@ cmp "$tmp/committed.caddy" "$ROOT/config/Caddyfile"
 [[ $(jq -r .subscription_domain "$ROOT/state/state.json") == next.example.com ]]
 [[ $(jq -r .domain "$ROOT/state/state.json") == panel.example.com ]]
 [[ ! -e $ROOT/state/caddy-domain-change ]]
-# Subscription HTTPS checks must verify both the 404 guard and working proxy.
+# Subscription HTTPS checks must verify the user panel homepage.
 (
   source ./install.sh
   ROOT=$tmp/probe
@@ -72,13 +70,13 @@ cmp "$tmp/committed.caddy" "$ROOT/config/Caddyfile"
   curl() {
     printf '%s\n' "$*" >> "$tmp/probe-calls"
     case "$*" in
-      *'/api/subscribe'*) printf '%s' "${PROXY_STATUS:-401}";;
-      *) printf 404;;
+      *) printf '%s' "${PANEL_STATUS:-200}";;
     esac
   }
   : > "$tmp/probe-calls"
   caddy_domain_verify >/dev/null
-  if ! grep -q '/api/subscribe' "$tmp/probe-calls"; then echo 'Subscription proxy was not checked'; exit 1; fi
-  if PROXY_STATUS=502 caddy_domain_verify >/dev/null 2>&1; then echo 'Broken subscription upstream accepted'; exit 1; fi
+  if ! grep -q 'https://mmw.example.com/' "$tmp/probe-calls"; then echo 'Subscription panel was not checked'; exit 1; fi
+  if PANEL_STATUS=404 caddy_domain_verify >/dev/null 2>&1; then echo 'Missing subscription panel accepted'; exit 1; fi
+  if PANEL_STATUS=502 caddy_domain_verify >/dev/null 2>&1; then echo 'Broken subscription upstream accepted'; exit 1; fi
 )
-echo 'PASS: subscription add/switch, restricted paths, durable independent state, panel confirmation and rollback'
+echo 'PASS: subscription add/switch, panel availability, durable independent state, panel confirmation and rollback'
