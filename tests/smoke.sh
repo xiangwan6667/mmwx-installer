@@ -20,10 +20,10 @@ CHANNEL=stable
 choose_version
 CADDY_IMAGE=mmwx-installer-caddy:2.11.4-cf0.2.4
 PG_IMAGE=postgres:18-alpine
-password=$(openssl rand -hex 24)
-printf 'MMWX_DATABASE_PASSWORD=%s\n' "$password" > "$ROOT/config/app.env"
+password=$(openssl rand -hex 32)
 printf 'POSTGRES_PASSWORD=%s\n' "$password" > "$ROOT/config/postgres.env"
 touch "$ROOT/config/caddy.env"
+prepare_secrets
 render_compose > "$ROOT/config/compose.yaml"
 printf ':80 {\n reverse_proxy mmwx:12889\n}\n' > "$ROOT/config/Caddyfile"
 docker compose -p mmwx-smoke -f "$ROOT/config/compose.yaml" config --format json | jq '.services.caddy.ports=[{target:80,published:"18080",host_ip:"127.0.0.1",protocol:"tcp"}] | (.services[].restart)="no"' > "$ROOT/compose.json"

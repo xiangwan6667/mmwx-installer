@@ -20,10 +20,11 @@ docker pull "$PG_IMAGE"
 APP_IMAGE=$(docker image inspect "$APP_IMAGE" --format '{{index .RepoDigests 0}}')
 PG_IMAGE=$(docker image inspect "$PG_IMAGE" --format '{{index .RepoDigests 0}}')
 CADDY_IMAGE=$APP_IMAGE
-printf 'POSTGRES_PASSWORD=test-ci-only\n' > "$ROOT/config/postgres.env"
-printf 'MMWX_DATABASE_PASSWORD=test-ci-only\n' > "$ROOT/config/app.env"
+db_password=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+printf 'POSTGRES_PASSWORD=%s\n' "$db_password" > "$ROOT/config/postgres.env"
 printf 'CF_API_TOKEN=test-ci-only-cloudflare-token\n' > "$ROOT/config/caddy.env"
 printf 'test-ci-only-cloudflare-token\n' > "$ROOT/config/cloudflare.token"
+prepare_secrets
 printf ':80 {}\n' > "$ROOT/config/Caddyfile"
 # The production renderer is sourced above; a fixture override is defined later.
 # shellcheck disable=SC2218
@@ -106,7 +107,7 @@ set -eu
 for directory in /app/data /app/subscribes /app/rule_templates; do
   printf 'failed\n' > "$directory/probe"
 done
-PGPASSWORD=test-ci-only psql -h postgres -U mmwx -d mmwx -v ON_ERROR_STOP=1 -Atc \
+PGPASSWORD=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef psql -h postgres -U mmwx -d mmwx -v ON_ERROR_STOP=1 -Atc \
   "UPDATE persistence_test SET value = 'failed' RETURNING value" > /app/data/failed-database-value
 touch /app/data/failed-update-ran
 exit 1

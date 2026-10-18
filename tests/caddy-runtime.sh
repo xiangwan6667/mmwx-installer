@@ -34,10 +34,10 @@ for image_ref in "$APP_IMAGE" "$PG_IMAGE" "$CADDY_IMAGE"; do docker pull "$image
 APP_IMAGE=$(docker image inspect "$APP_IMAGE" --format '{{index .RepoDigests 0}}')
 PG_IMAGE=$(docker image inspect "$PG_IMAGE" --format '{{index .RepoDigests 0}}')
 CADDY_IMAGE=$(docker image inspect "$CADDY_IMAGE" --format '{{index .RepoDigests 0}}')
-printf 'POSTGRES_PASSWORD=test-ci-only\n' > "$ROOT/config/postgres.env"
-printf 'MMWX_DATABASE_PASSWORD=test-ci-only\n' > "$ROOT/config/app.env"
+printf 'POSTGRES_PASSWORD=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' > "$ROOT/config/postgres.env"
 printf 'old-ci-token-00000000000000000000\n' > "$ROOT/config/cloudflare.token"
 printf 'CF_API_TOKEN=old-ci-token-00000000000000000000\nEXTRA_SETTING=preserve-me\n' > "$ROOT/config/caddy.env"
+prepare_secrets
 printf 'new-ci-token-11111111111111111111\n' > "$ROOT/input.token"
 cat "$ROOT/config/cloudflare.token" "$ROOT/input.token" > "$ROOT/forbidden.tokens"
 chmod 600 "$ROOT/config/cloudflare.token" "$ROOT/config/caddy.env" "$ROOT/input.token"
@@ -57,15 +57,13 @@ docker compose -f "$ROOT/original.yaml" config --no-env-resolution --format json
   .services.caddy.ports=[{target:443,published:"443",host_ip:"127.0.0.1",protocol:"tcp"}] |
   .services.caddy.depends_on.mmwx.condition="service_started" |
   del(.services.caddy.environment.CF_API_TOKEN,
-      .services.mmwx.environment.MMWX_DATABASE_PASSWORD,
       .services.postgres.environment.POSTGRES_PASSWORD) |
   .services.caddy.env_file=[$root+"/config/caddy.env"] |
-  .services.mmwx.env_file=[$root+"/config/app.env"] |
   .services.postgres.env_file=[$root+"/config/postgres.env"] |
   .services.mmwx.command=["sleep","infinity"] | del(.services.mmwx.healthcheck)
 ' > "$ROOT/config/compose.yaml"
 jq -e --arg root "$ROOT" '.services.caddy.env_file==[$root+"/config/caddy.env"] and
-  .services.mmwx.env_file==[$root+"/config/app.env"] and
+  (.services.mmwx.env_file // null)==null and
   .services.postgres.env_file==[$root+"/config/postgres.env"] and
   .services.caddy.environment.CF_API_TOKEN==null' "$ROOT/config/compose.yaml" >/dev/null
 save_state
@@ -95,8 +93,8 @@ jq '.services.mmwx.environment.UNAPPLIED_FIXTURE_CHANGE="yes" |
     .services.postgres.environment.UNAPPLIED_FIXTURE_CHANGE="yes"' \
   "$ROOT/config/compose.yaml" > "$ROOT/config/compose.next"
 mv "$ROOT/config/compose.next" "$ROOT/config/compose.yaml"
-sha256sum "$ROOT/config/compose.yaml" "$ROOT/config/Caddyfile" "$ROOT/config/app.env" \
-  "$ROOT/config/postgres.env" "$ROOT/state/state.json" "$ROOT/state/progress.json" > "$ROOT/unchanged.sha256"
+sha256sum "$ROOT/config/compose.yaml" "$ROOT/config/Caddyfile" "$ROOT/config/postgres.env" \
+  "$ROOT/data/app/database.json" "$ROOT/state/state.json" "$ROOT/state/progress.json" > "$ROOT/unchanged.sha256"
 find "$ROOT/certs/data" -type f \( -name '*.crt' -o -name '*.key' \) -exec sha256sum {} + | sort > "$ROOT/certificates.sha256"
 [[ -s $ROOT/certificates.sha256 ]]
 declare -A before_id before_started
@@ -228,7 +226,7 @@ for service in caddy mmwx postgres; do
 done
 cp "$ROOT/config/cloudflare.token" "$ROOT/domain-token"
 cp "$ROOT/config/caddy.env" "$ROOT/domain-caddy.env"
-sha256sum "$ROOT/config/compose.yaml" "$ROOT/config/app.env" "$ROOT/config/postgres.env" > "$ROOT/domain-files.sha256"
+sha256sum "$ROOT/config/compose.yaml" "$ROOT/config/postgres.env" "$ROOT/data/app/database.json" > "$ROOT/domain-files.sha256"
 find "$ROOT/certs/data" -type f \( -name '*.crt' -o -name '*.key' \) -exec sha256sum {} + | sort > "$ROOT/domain-certs.sha256"
 change_caddy_domain "$new_domain" > "$ROOT/domain-success-output" 2>&1
 DOMAIN=$new_domain

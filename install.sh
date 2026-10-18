@@ -20,13 +20,16 @@ trace_redact() (
   local path item line value
   local -a secrets=()
   for path in "$ROOT/config/cloudflare.token" "$ROOT/cloudflare.token" "${TOKEN_FILE:-}" "${TEMP_TOKEN:-}" \
-    "$ROOT/config/caddy.env" "$ROOT/config/postgres.env" "$ROOT/config/app.env" \
+    "$ROOT/config/caddy.env" "$ROOT/config/postgres.env" "$ROOT/config/app.env" "$ROOT/data/app/database.json" \
     "$ROOT/state/caddy-token-change/old.token" "$ROOT/state/caddy-token-change/candidate.token"; do
     [[ -n $path && -f $path ]] || continue
     [[ -r $path ]] || { printf '凭据不可读，已隐藏日志输出。\n'; cat >/dev/null; return 1; }
     while IFS= read -r item || [[ -n $item ]]; do
       if [[ $path == *.env ]]; then
         case "${item%%=*}" in *TOKEN*|*PASSWORD*|*SECRET*) value=${item#*=};; *) continue;; esac
+      elif [[ $path == */database.json ]]; then
+        value=$(sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$path")
+        [[ -n $value ]] || continue
       else value=$item; fi
       value=${value%$'\r'}; value=${value#\"}; value=${value%\"}; value=${value#\'}; value=${value%\'}
       [[ -z $value ]] || secrets+=("$value")
@@ -363,16 +366,10 @@ services:
   mmwx:
     image: $APP_IMAGE
     restart: unless-stopped
-    env_file: ["$ROOT/config/app.env"]
     environment:
       TZ: Asia/Shanghai
       PORT: "12889"
-      MMWX_DATABASE_DRIVER: postgres
-      MMWX_DATABASE_HOST: postgres
-      MMWX_DATABASE_PORT: "5432"
-      MMWX_DATABASE_NAME: mmwx
-      MMWX_DATABASE_USER: mmwx
-      MMWX_DATABASE_SSLMODE: disable
+      LOG_LEVEL: info
     volumes:
       - $ROOT/data/app:/app/data
       - $ROOT/data/subscribes:/app/subscribes
@@ -609,7 +606,7 @@ check_app_image_probe() (
     local phase=$1 url=$2 code
     shift 2
     if status=$(curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -sSL \
-      --connect-timeout 10 --max-time 30 --max-redirs 3 \
+      --connect-timeout 5 --max-time 15 --max-redirs 3 \
       -o "$dir/body" -w '%{http_code}' "$@" "$url" 2>> "$logfile"); then
       printf '%s HTTP %s\n' "$phase" "$status" >> "$logfile"
     else
@@ -1326,8 +1323,8 @@ load_progress() {
   CADDY_IMAGE=$(jq -r '.caddy // ""' "$ROOT/state/progress.json")
   PG_IMAGE=$(jq -r '.pg // "postgres:18-alpine"' "$ROOT/state/progress.json")
 }
-prepare_secrets() {
-  local password
+prepare_database() {
+  local password database_file
   if [[ -f $ROOT/config/postgres.env ]]; then
     password=$(sed -n 's/^POSTGRES_PASSWORD=//p' "$ROOT/config/postgres.env")
     [[ $password =~ ^[a-f0-9]{64}$ ]] || die '数据库密码文件格式异常，未覆盖。'
@@ -1337,8 +1334,20 @@ prepare_secrets() {
     printf 'POSTGRES_PASSWORD=%s\n' "$password" > "$ROOT/config/postgres.env.tmp"
     mv "$ROOT/config/postgres.env.tmp" "$ROOT/config/postgres.env"
   fi
-  printf 'MMWX_DATABASE_PASSWORD=%s\n' "$password" > "$ROOT/config/app.env.tmp"
-  mv "$ROOT/config/app.env.tmp" "$ROOT/config/app.env"
+  database_file=$ROOT/data/app/database.json
+  [[ ! -L $ROOT/data && ! -L $ROOT/data/app && ! -L $database_file ]] || die '数据库目录或配置不能是符号链接。'
+  mkdir -p "$ROOT/data/app"
+  if [[ -f $database_file ]]; then
+    jq -e --arg password "$password" 'type=="object" and .driver=="postgres" and .host=="postgres" and .port==5432 and .database=="mmwx" and .username=="mmwx" and .password==$password and (.ssl_mode=="disable")' "$database_file" >/dev/null || die '数据库配置与 postgres.env 不一致，请检查 data/app/database.json。'
+    chmod 600 "$database_file"
+  else
+    jq -n --arg password "$password" '{driver:"postgres",host:"postgres",port:5432,database:"mmwx",username:"mmwx",password:$password,ssl_mode:"disable",max_open_conns:30,max_idle_conns:10}' > "$database_file.tmp"
+    chmod 600 "$database_file.tmp"
+    mv "$database_file.tmp" "$database_file"
+  fi
+}
+prepare_secrets() {
+  prepare_database
   if [[ ! -f $ROOT/config/caddy.env ]]; then
     [[ -f $ROOT/config/cloudflare.token ]] || die '缺少 Token，请重新提供。'
     printf 'CF_API_TOKEN=%s\n' "$(cat "$ROOT/config/cloudflare.token")" > "$ROOT/config/caddy.env.tmp"
@@ -1536,6 +1545,7 @@ recover_update() {
   cp "$backup/state.json" "$ROOT/state/state.json"
   CHANNEL=''
   load_state
+  prepare_database
   render_compose > "$ROOT/config/compose.yaml.tmp"
   mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
   run_step '启动主控' dc up -d --no-deps --wait --wait-timeout 300 mmwx
@@ -1554,6 +1564,9 @@ update_stack() {
   [[ ! -f $ROOT/state/update.json && ! -f $ROOT/state/image-rollback.json ]] || die '请先通过菜单 5 继续未完成的更新或版本回退。'
   [[ ! -f $ROOT/state/progress.json ]] || [[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]] || die '请先继续完成安装。'
   load_state
+  # Older releases supplied database settings through app.env. Create the
+  # current database.json before the first update removes that env file.
+  prepare_database
   local backup current_version=$VERSION
   recent_releases stable update "$current_version" <<<'[]' >/dev/null || die '当前版本号无效。'
   choose_version update "$current_version" || return 0
@@ -1607,10 +1620,15 @@ finish_reinstall() {
   cmp -s "$ROOT/state/state.json" "$ROOT/state/reinstall.json" || die '安装记录已变化，停止镜像重装。'
   CHANNEL=''
   load_state
-  for name in compose.yaml Caddyfile postgres.env app.env caddy.env cloudflare.token; do
+  for name in compose.yaml Caddyfile postgres.env caddy.env cloudflare.token; do
     [[ -f $ROOT/config/$name ]] || die "缺少配置 $name，停止重装以保留现有数据。"
   done
+  prepare_database
   network_is_ready || die '请检查 UFW/IPv6 配置后继续重装。'
+  if grep -q 'app\.env' "$ROOT/config/compose.yaml"; then
+    render_compose > "$ROOT/config/compose.yaml.tmp"
+    mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"
+  fi
   dc config --format json | jq -e --arg app "$APP_IMAGE" --arg caddy "$CADDY_IMAGE" --arg pg "$PG_IMAGE" \
     '.services.mmwx.image==$app and .services.caddy.image==$caddy and .services.postgres.image==$pg' >/dev/null || die '容器配置与安装记录不一致，停止重装。'
   run_step "重新拉取主控 $VERSION" docker pull "$APP_IMAGE" || die '主控镜像下载失败，可通过菜单 5 继续。'
@@ -1700,6 +1718,7 @@ finish_image_rollback() {
   VERSION=$(jq -er .version "$ROOT/state/image-rollback.json")
   APP_IMAGE=$(jq -er .app "$ROOT/state/image-rollback.json")
   CHANNEL=$(jq -er .channel "$ROOT/state/image-rollback.json")
+  prepare_database
   run_step "检查目标主控 $VERSION" docker pull "$APP_IMAGE"
   render_compose > "$ROOT/config/compose.yaml.tmp"
   mv "$ROOT/config/compose.yaml.tmp" "$ROOT/config/compose.yaml"

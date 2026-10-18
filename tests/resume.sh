@@ -15,10 +15,11 @@ DOMAIN=panel.example.com CHANNEL=stable VERSION=v1 APP_IMAGE=app:v1 CADDY_IMAGE=
 printf 'test-token' > "$ROOT/config/cloudflare.token"
 prepare_secrets
 first=$(cat "$ROOT/config/postgres.env")
-rm "$ROOT/config/app.env"
+rm "$ROOT/data/app/database.json"
 prepare_secrets
 [[ $(cat "$ROOT/config/postgres.env") == "$first" ]]
-[[ $(cut -d= -f2 "$ROOT/config/app.env") == "${first#*=}" ]]
+[[ $(jq -r .password "$ROOT/data/app/database.json") == "${first#*=}" ]]
+[[ ! -e $ROOT/config/app.env ]]
 checkpoint 3
 DOMAIN='' CHANNEL='' VERSION=''
 load_progress
@@ -50,5 +51,6 @@ if TEST_ROOT=$tmp PHASE=interrupted bash "$tmp/harness.sh" >/dev/null; then echo
 TEST_ROOT=$tmp PHASE=resume bash "$tmp/harness.sh" >/dev/null
 [[ $(jq -r .stage "$ROOT/state/progress.json") == 7 ]]
 [[ $(cat "$ROOT/config/postgres.env") == "$first" ]]
+[[ $(jq -r .password "$ROOT/data/app/database.json") == "${first#*=}" ]]
 [[ $(cat "$ROOT/calls") == network-checked ]]
 echo 'PASS: interrupted install resumes, preserves credentials and rechecks networking'

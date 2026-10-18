@@ -45,6 +45,8 @@ docker() {
 }
 reset_case() {
   CHANNEL=stable CHANNEL_EXPLICIT=1 ACTION=install ACCEPT=0 VERSION='' APP_IMAGE=''
+  printf 'POSTGRES_PASSWORD=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' > "$ROOT/config/postgres.env"
+  printf 'CF_API_TOKEN=test-ci-only-token\n' > "$ROOT/config/caddy.env"
   printf '{}' > "$tmp/status"
   : > "$tmp/answers"; : > "$tmp/checked"; : > "$tmp/pulls"; : > "$tmp/prompts"
 }

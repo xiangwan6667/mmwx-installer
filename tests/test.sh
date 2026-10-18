@@ -50,9 +50,11 @@ render_compose > "$tmp/compose.yaml"
 render_caddy > "$tmp/Caddyfile"
 if command -v docker >/dev/null; then
   printf 'CF_API_TOKEN=test-only\n' > "$ROOT/config/caddy.env"
-  printf 'MMWX_DATABASE_PASSWORD=test-only\n' > "$ROOT/config/app.env"
   printf 'POSTGRES_PASSWORD=test-only\n' > "$ROOT/config/postgres.env"
   docker compose -f "$tmp/compose.yaml" config --format json > "$tmp/config.json"
   jq -e '.services.mmwx.ports == null and .services.postgres.ports == null and (.services.caddy.ports | length == 2) and .networks.database.internal == true' "$tmp/config.json" >/dev/null
+  if jq -e 'any(.services.mmwx.environment | keys[]; startswith("MMWX_DATABASE_"))' "$tmp/config.json" >/dev/null; then
+    echo 'Database connection must come from data/app/database.json'; exit 1
+  fi
 fi
 echo 'PASS: channel selection, unsafe input rejection, network validation, configuration rendering'

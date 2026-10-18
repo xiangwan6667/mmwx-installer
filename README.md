@@ -72,7 +72,7 @@ bash -o pipefail -c 'if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca
 
 主控可选择最新正式版、最新测试版或指定版本。更新只允许高于当前版本，回退只允许低于当前版本；指定版本先按方向筛选，再列出所选通道最近 5 个候选。正式版和测试版可以跨通道切换，统一按版本号比较，例如 `0.5.5-beta.2 < 0.5.5-beta.10 < 0.5.5 < 0.5.6-beta.1`。
 
-更新前检查镜像并完成下载，失败时恢复原主控版本、数据库和应用文件。菜单 6 仅切换主控镜像，保留当前数据，旧版本仍可能与现有数据库不兼容。同版本不会执行更新或回退；菜单 7 可重新拉取并重建当前版本的主控，Caddy 和 PostgreSQL 保持运行。
+更新前检查镜像并完成下载，失败时恢复原主控版本、数据库和应用文件。菜单 6 仅切换主控镜像，保留当前数据；菜单 7 可重新拉取并重建当前版本的主控，Caddy 和 PostgreSQL 保持运行。旧版本是否兼容当前数据库由上游决定。
 
 最新版镜像尚未就绪时，可经 `y/n` 确认使用同通道、符合升降方向的上一可用版本；没有合适候选时返回菜单。镜像仓库的网络、限流或鉴权错误会停止操作。GitHub API 查询失败时尝试读取发布网页；分页达到上限时提示查询范围有限。
 
@@ -116,7 +116,7 @@ mmwx logs          # 最近 80 行服务日志
 mmwx caddy-token --cf-token-file /root/cloudflare.token
 ```
 
-新 Token 必须具备主控与订阅域名所在区域的读取和 DNS 编辑权限。脚本会先用临时 TXT 记录逐个验证区域权限，成功后才替换凭据并重建 Caddy；失败时恢复旧配置。主控和 PostgreSQL 保持运行。
+新 Token 必须具备已配置域名所在区域的读取和 DNS 编辑权限。脚本会先用临时 TXT 记录逐个验证区域权限，成功后才替换凭据并重建 Caddy；失败时恢复旧配置。主控和 PostgreSQL 保持运行。
 
 变更域名可在 Caddy 菜单中操作，或运行：
 
@@ -139,7 +139,7 @@ mmwx caddy-subscription-add --zone example.com --prefix mmw
 
 订阅域名与主控域名分别保存，不能使用同一个域名。脚本自动配置 DNS、证书和反代，新增后按提示到面板 **系统设置 → 系统 → 订阅域名** 填写完整地址（如 `https://mmw.example.com`）并保存。切换时先保留新旧订阅域名，确认面板设置已更新、订阅正常后才清理旧域名；暂未完成可从主菜单 5 继续。
 
-订阅域名是独立的用户面板入口，完整反代妙妙屋，用户可以直接打开 `https://mmw.example.com/` 登录和使用面板；订阅链接、客户端上报和面板接口通过该域名访问。
+订阅域名是本安装器的独立用户面板入口，完整反代妙妙屋；用户可以直接打开 `https://mmw.example.com/` 登录和使用面板，订阅链接、客户端上报和面板接口也通过该域名访问。上游文档的 Caddy/Nginx 示例只放行订阅路径，和本安装器的策略不同。
 
 已使用 v0.3.2 添加订阅域名、首页返回 404 时，先更新管理脚本，再执行 `mmwx caddy-reload`（Caddy 子菜单 3）。脚本会将原版订阅路径限制改为完整面板反代，原配置保存为 `/opt/mmwx-installer/state/Caddyfile-before-subscription-panel`，校验或重载失败时恢复原配置。
 
@@ -149,10 +149,10 @@ mmwx caddy-subscription-add --zone example.com --prefix mmw
 
 ```text
 /opt/mmwx-installer/
-├── config/              Compose、环境变量、Caddy 配置和 Token
+├── config/              Compose、Caddy 配置和 Cloudflare Token
 ├── data/
 │   ├── postgres/        PostgreSQL 数据
-│   ├── app/             应用数据
+│   ├── app/             应用数据和 database.json
 │   ├── subscribes/      订阅文件
 │   └── rule_templates/  规则模板
 ├── certs/               证书及 Caddy 状态
@@ -160,7 +160,7 @@ mmwx caddy-subscription-add --zone example.com --prefix mmw
 └── state/               任务进度、版本记录、网络恢复配置和日志
 ```
 
-安装中断后选择菜单 1 或 5；已完成安装后的服务恢复使用菜单 5。重要数据应另行备份到其他机器。主控更新不会重启 Caddy；更新或恢复失败时，可从菜单 4 查看任务日志，再通过菜单 5 继续。
+安装中断后选择菜单 1 或 5；已完成安装后的服务恢复使用菜单 5。主控更新不会重启 Caddy；更新或恢复失败时，可从菜单 4 查看任务日志，再通过菜单 5 继续。数据库连接保存在 `data/app/database.json`（权限 0600），数据库密码保存在 `config/postgres.env`；旧安装更新、回退或重装时会自动从现有密码配置迁移该文件。请勿提交或公开这两个文件。
 
 ## 架构
 

@@ -13,7 +13,9 @@ jq '.version="v0" | .app="app@sha256:old"' "$ROOT/state/progress.json" > "$ROOT/
 mv "$ROOT/state/older.json" "$ROOT/state/progress.json"
 cp "$ROOT/state/state.json" "$tmp/original-state"
 cp "$ROOT/state/progress.json" "$tmp/original-progress"
-for name in compose.yaml Caddyfile postgres.env app.env caddy.env cloudflare.token; do printf 'original-%s\n' "$name" > "$ROOT/config/$name"; done
+for name in compose.yaml Caddyfile caddy.env cloudflare.token; do printf 'original-%s\n' "$name" > "$ROOT/config/$name"; done
+printf 'POSTGRES_PASSWORD=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' > "$ROOT/config/postgres.env"
+prepare_secrets
 printf database > "$ROOT/data/postgres/value"
 printf application > "$ROOT/data/app/value"
 printf certificate > "$ROOT/certs/data/value"
